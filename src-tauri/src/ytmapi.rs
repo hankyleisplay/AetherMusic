@@ -64,6 +64,17 @@ fn pick_best_thumbnail(val: Option<&Value>) -> String {
         .unwrap_or_default()
 }
 
+pub fn pick_best_thumbnail_with_fallback(val: Option<&Value>, video_id: &str) -> String {
+    let primary = pick_best_thumbnail(val);
+    if !primary.is_empty() {
+        return primary;
+    }
+    if !video_id.is_empty() && !video_id.starts_with("local-") {
+        return format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg");
+    }
+    String::new()
+}
+
 pub fn parse_duration_seconds(text: &str) -> Option<u64> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -234,7 +245,10 @@ fn parse_responsive_list_item(item: &Value, is_auto: bool) -> Option<Track> {
         }
     }
 
-    let thumbnail_url = pick_best_thumbnail(m.pointer("/thumbnail/musicThumbnailRenderer/thumbnail"));
+    let thumbnail_url = pick_best_thumbnail_with_fallback(
+        m.pointer("/thumbnail/musicThumbnailRenderer/thumbnail"),
+        &video_id,
+    );
 
     Some(Track {
         video_id,
@@ -265,8 +279,10 @@ fn parse_two_row_item(item: &Value, is_auto: bool) -> Option<Track> {
     }
     let (artist, album, duration_text, duration_seconds) =
         split_byline_runs(m.pointer("/subtitle/runs"));
-    let thumbnail_url =
-        pick_best_thumbnail(m.pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail"));
+    let thumbnail_url = pick_best_thumbnail_with_fallback(
+        m.pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail"),
+        &video_id,
+    );
 
     Some(Track {
         video_id,
@@ -293,7 +309,7 @@ fn parse_playlist_panel_video(item: &Value, is_auto: bool) -> Option<Track> {
         .trim()
         .to_string();
     let duration_seconds = parse_duration_seconds(&duration_text).unwrap_or(0);
-    let thumbnail_url = pick_best_thumbnail(v.get("thumbnail"));
+    let thumbnail_url = pick_best_thumbnail_with_fallback(v.get("thumbnail"), &video_id);
 
     Some(Track {
         video_id,
@@ -311,6 +327,87 @@ fn parse_playlist_panel_video(item: &Value, is_auto: bool) -> Option<Track> {
     })
 }
 
+fn extract_search_tracks_from_data(data: &Value) -> Vec<Track> {
+    let mut results = Vec::new();
+    let Some(tabs) = data
+        .pointer("/contents/tabbedSearchResultsRenderer/tabs")
+        .and_then(|v| v.as_array())
+    else {
+        return results;
+    };
+
+    for tab in tabs {
+        let Some(sections) = tab
+            .pointer("/tabRenderer/content/sectionListRenderer/contents")
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+        for sec in sections {
+            if let Some(shelf_items) = sec
+                .pointer("/musicShelfRenderer/contents")
+                .and_then(|v| v.as_array())
+            {
+                for item in shelf_items {
+                    if let Some(track) = parse_responsive_list_item(item, false) {
+                        results.push(track);
+                    }
+                }
+            }
+            if let Some(item_section_contents) = sec
+                .pointer("/itemSectionRenderer/contents")
+                .and_then(|v| v.as_array())
+            {
+                for item in item_section_contents {
+                    if let Some(track) = parse_responsive_list_item(item, false) {
+                        results.push(track);
+                    }
+                }
+            }
+            if let Some(card_item) = sec.pointer("/musicCardShelfRenderer") {
+                if let Some(vid) = card_item
+                    .pointer("/onTap/watchEndpoint/videoId")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        card_item
+                            .pointer("/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId")
+                            .and_then(|v| v.as_str())
+                    })
+                {
+                    let title = collect_runs_text(card_item.pointer("/title/runs"));
+                    let (artist, album, dur_t, dur_s) =
+                        split_byline_runs(card_item.pointer("/subtitle/runs"));
+                    let thumb = pick_best_thumbnail_with_fallback(
+                        card_item.pointer("/thumbnail/musicThumbnailRenderer/thumbnail"),
+                        vid,
+                    );
+                    if !title.is_empty() && !vid.is_empty() {
+                        results.push(Track {
+                            video_id: vid.to_string(),
+                            title,
+                            artist,
+                            album,
+                            duration_text: dur_t,
+                            duration_seconds: dur_s,
+                            thumbnail_url: thumb,
+                            is_auto_recommended: false,
+                        });
+                    }
+                }
+                if let Some(card_contents) = card_item.pointer("/contents").and_then(|v| v.as_array()) {
+                    for sub in card_contents {
+                        if let Some(track) = parse_responsive_list_item(sub, false) {
+                            results.push(track);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
 pub async fn search_tracks(
     state: &AppState,
     query: &str,
@@ -321,74 +418,59 @@ pub async fn search_tracks(
         return Ok(Vec::new());
     }
 
-    let mut body = ytm_context();
-    body["query"] = json!(trimmed);
-
-    match filter.unwrap_or("songs") {
-        "songs" => {
-            body["params"] = json!("EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D");
-        }
-        "videos" => {
-            body["params"] = json!("EgWKAQIQAWoKEAkQBRAKEAMQBA%3D%3D");
-        }
-        _ => {}
+    let filter_mode = filter.unwrap_or("songs");
+    if filter_mode == "videos" {
+        let mut body = ytm_context();
+        body["query"] = json!(trimmed);
+        body["params"] = json!("EgWKAQIQAWoKEAkQBRAKEAMQBA==");
+        let data = post_ytm(state, "search", body).await?;
+        return Ok(extract_search_tracks_from_data(&data));
     }
 
-    let data = post_ytm(state, "search", body).await?;
-    let mut results = Vec::new();
+    let mut general_body = ytm_context();
+    general_body["query"] = json!(trimmed);
 
-    if let Some(tabs) = data
-        .pointer("/contents/tabbedSearchResultsRenderer/tabs")
-        .and_then(|v| v.as_array())
-    {
-        for tab in tabs {
-            let Some(sections) = tab
-                .pointer("/tabRenderer/content/sectionListRenderer/contents")
-                .and_then(|v| v.as_array())
-            else {
-                continue;
-            };
-            for sec in sections {
-                if let Some(shelf_items) = sec
-                    .pointer("/musicShelfRenderer/contents")
-                    .and_then(|v| v.as_array())
-                {
-                    for item in shelf_items {
-                        if let Some(track) = parse_responsive_list_item(item, false) {
-                            results.push(track);
-                        }
-                    }
-                }
-                if let Some(card_item) = sec.pointer("/musicCardShelfRenderer") {
-                    if let Some(vid) = card_item
-                        .pointer("/onTap/watchEndpoint/videoId")
-                        .and_then(|v| v.as_str())
-                    {
-                        let title = collect_runs_text(card_item.pointer("/title/runs"));
-                        let (artist, album, dur_t, dur_s) =
-                            split_byline_runs(card_item.pointer("/subtitle/runs"));
-                        let thumb = pick_best_thumbnail(
-                            card_item.pointer("/thumbnail/musicThumbnailRenderer/thumbnail"),
-                        );
-                        if !title.is_empty() {
-                            results.push(Track {
-                                video_id: vid.to_string(),
-                                title,
-                                artist,
-                                album,
-                                duration_text: dur_t,
-                                duration_seconds: dur_s,
-                                thumbnail_url: thumb,
-                                is_auto_recommended: false,
-                            });
-                        }
-                    }
-                }
-            }
+    let mut songs_body = ytm_context();
+    songs_body["query"] = json!(trimmed);
+    songs_body["params"] = json!("EgWKAQIIAWoKEAkQBRAKEAMQBA==");
+
+    let (general_res, songs_res) = tokio::join!(
+        post_ytm(state, "search", general_body),
+        post_ytm(state, "search", songs_body)
+    );
+
+    if general_res.is_err() && songs_res.is_err() {
+        return Err(songs_res.err().unwrap_or_else(|| "Search failed".to_string()));
+    }
+
+    let general_tracks = general_res
+        .map(|d| extract_search_tracks_from_data(&d))
+        .unwrap_or_default();
+    let songs_tracks = songs_res
+        .map(|d| extract_search_tracks_from_data(&d))
+        .unwrap_or_default();
+
+    let mut merged: Vec<Track> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Put top playable matches from unfiltered search first (catches official MVs/EPs like "Looks Can Kill")
+    for t in general_tracks.iter().take(4) {
+        if seen.insert(t.video_id.clone()) {
+            merged.push(t.clone());
+        }
+    }
+    for t in songs_tracks {
+        if seen.insert(t.video_id.clone()) {
+            merged.push(t);
+        }
+    }
+    for t in general_tracks.into_iter().skip(4) {
+        if seen.insert(t.video_id.clone()) {
+            merged.push(t);
         }
     }
 
-    Ok(results)
+    Ok(merged)
 }
 
 pub async fn get_song_metadata(state: &AppState, video_id: &str) -> Result<SongMetadata, String> {
@@ -510,6 +592,10 @@ pub async fn get_song_metadata(state: &AppState, video_id: &str) -> Result<SongM
         if let Ok(radio_tracks) = get_radio_recommendations(state, video_id).await {
             related_tracks = radio_tracks.into_iter().take(12).collect();
         }
+    }
+
+    if thumbnail_url.is_empty() {
+        thumbnail_url = pick_best_thumbnail_with_fallback(None, video_id);
     }
 
     Ok(SongMetadata {

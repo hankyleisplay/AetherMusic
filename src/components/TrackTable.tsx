@@ -1,5 +1,6 @@
 import { Heart, ListEnd, ListPlus, Play, Sparkles, Trash2 } from "lucide-react";
 import type { Track } from "../types";
+import { AlbumArt } from "./AlbumArt";
 
 interface TrackTableProps {
   tracks: Track[];
@@ -57,11 +58,12 @@ export function TrackTable({
             </div>
 
             <div className="track-main">
-              <img
-                src={track.thumbnailUrl}
-                alt={track.title}
+              <AlbumArt
+                thumbnailUrl={track.thumbnailUrl}
+                videoId={track.videoId}
+                title={track.title}
+                artist={track.artist}
                 className="track-thumb"
-                loading="lazy"
               />
               <div className="track-text">
                 <div className="track-name truncate" title={track.title}>

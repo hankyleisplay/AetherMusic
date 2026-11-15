@@ -61,6 +61,10 @@ pub struct StreamInfo {
     pub mime_type: String,
     pub acodec: String,
     pub abr: String,
+    pub sample_rate: String,
+    pub bit_depth: String,
+    pub quality_label: String,
+    pub engine_used: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +83,32 @@ pub struct EngineStatus {
     pub ytdlp_path: String,
     pub ytmapi_ready: bool,
     pub proxy_port: u16,
+    pub platform: String,
+    pub arch: String,
+    pub innertube_fallback_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStatus {
+    pub current_app_version: String,
+    pub latest_app_version: String,
+    pub app_update_available: bool,
+    pub release_url: String,
+    pub release_notes: String,
+    pub ytdlp_current_version: String,
+    pub ytdlp_latest_version: String,
+    pub ytdlp_update_available: bool,
+    pub last_checked: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateActionResult {
+    pub success: bool,
+    pub message: String,
+    pub updated_ytdlp_version: String,
+    pub release_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +117,10 @@ pub struct CachedStream {
     pub mime_type: String,
     pub acodec: String,
     pub abr: String,
+    pub sample_rate: String,
+    pub bit_depth: String,
+    pub quality_label: String,
+    pub engine_used: String,
     pub fetched_at: Instant,
 }
 

@@ -1,10 +1,12 @@
 pub mod models;
 pub mod proxy;
+pub mod updater;
 pub mod ytdlp;
 pub mod ytmapi;
 
 use models::{
     AppState, EngineStatus, HomeSection, LyricsResponse, SongMetadata, StreamInfo, Track,
+    UpdateActionResult, UpdateStatus,
 };
 use tauri::{Manager, State};
 
@@ -49,15 +51,21 @@ async fn get_lyrics(
 async fn get_stream_url(
     state: State<'_, AppState>,
     video_id: String,
+    quality: Option<String>,
 ) -> Result<StreamInfo, String> {
-    ytdlp::build_stream_info(&state, &video_id).await
+    ytdlp::build_stream_info(&state, &video_id, quality.as_deref()).await
 }
 
 #[tauri::command]
-async fn prefetch_stream(state: State<'_, AppState>, video_id: String) -> Result<(), String> {
+async fn prefetch_stream(
+    state: State<'_, AppState>,
+    video_id: String,
+    quality: Option<String>,
+) -> Result<(), String> {
     let st = state.inner().clone();
+    let q = quality.unwrap_or_else(|| "lossless".to_string());
     tokio::spawn(async move {
-        let _ = ytdlp::get_or_extract_stream(&st, &video_id).await;
+        let _ = ytdlp::get_or_extract_stream(&st, &video_id, &q).await;
     });
     Ok(())
 }
@@ -85,7 +93,20 @@ async fn get_engine_status(state: State<'_, AppState>) -> Result<EngineStatus, S
         ytdlp_path,
         ytmapi_ready: true,
         proxy_port,
+        platform: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        innertube_fallback_ready: true,
     })
+}
+
+#[tauri::command]
+async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateStatus, String> {
+    updater::check_updates(&state).await
+}
+
+#[tauri::command]
+async fn run_core_update(state: State<'_, AppState>) -> Result<UpdateActionResult, String> {
+    updater::perform_core_update(&state).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -133,6 +154,8 @@ pub fn run() {
             get_recommendations,
             get_home_discovery,
             get_engine_status,
+            check_for_updates,
+            run_core_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AetherMusic tauri application");
@@ -162,6 +185,10 @@ mod tests {
         let small = "https://yt3.googleusercontent.com/abc=w120-h120-s-l90-rj";
         let big = ytmapi::upgrade_thumbnail_url(small);
         assert_eq!(big, "https://yt3.googleusercontent.com/abc=w544-h544-l90-rj");
+        assert_eq!(
+            ytmapi::pick_best_thumbnail_with_fallback(None, "dQw4w9WgXcQ"),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+        );
     }
 
     #[tokio::test]
@@ -204,10 +231,24 @@ mod tests {
             "lyrics should be found"
         );
 
-        let stream = ytdlp::build_stream_info(&state, &first.video_id)
+        let stream = ytdlp::build_stream_info(&state, &first.video_id, Some("lossless"))
             .await
             .expect("yt-dlp stream extraction");
         assert!(stream.proxy_url.starts_with(&format!("http://127.0.0.1:{port}/stream/")));
+        assert!(!stream.sample_rate.is_empty());
+
+        // Verify pure-Rust InnerTube VISIONOS fallback (used on Android & Linux/Windows fallback)
+        let it_stream = ytdlp::extract_stream_innertube(&state, &first.video_id, "lossless")
+            .await
+            .expect("pure-Rust innertube stream extraction");
+        assert!(!it_stream.direct_url.is_empty());
+        assert_eq!(it_stream.engine_used, "rust-innertube");
+
+        // Verify updater check works
+        let upd = updater::check_updates(&state)
+            .await
+            .expect("update status check");
+        assert_eq!(upd.current_app_version, env!("CARGO_PKG_VERSION"));
 
         // Verify local HTTP proxy supports Range requests with 206 Partial Content & CORS
         let resp = state
@@ -227,6 +268,15 @@ mod tests {
                 .get("access-control-allow-origin")
                 .and_then(|v| v.to_str().ok()),
             Some("*")
+        );
+
+        // Verify hybrid YTMAPI search finds official releases even outside pure Songs filter (e.g., "Looks Can Kill")
+        let lck = ytmapi::search_tracks(&state, "Looks Can Kill", Some("songs"))
+            .await
+            .expect("Looks Can Kill search");
+        assert!(
+            lck.iter().any(|t| t.title.to_lowercase().contains("looks can kill")),
+            "expected 'Looks Can Kill' in hybrid search results"
         );
         let bytes = resp.bytes().await.expect("proxy body bytes");
         assert!(!bytes.is_empty(), "proxy returned empty body");

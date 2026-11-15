@@ -119,7 +119,10 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let path = target.split('?').next().unwrap_or(&target);
+    let (path, query_str) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target.as_str(), ""),
+    };
     if path == "/health" {
         let _ = write_simple_response(&mut socket, "200 OK", "text/plain; charset=utf-8", b"ok").await;
         return Ok(());
@@ -136,6 +139,11 @@ async fn handle_connection(
         return Ok(());
     }
 
+    let quality = query_str
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("quality="))
+        .unwrap_or("lossless");
+
     if method != "GET" && method != "HEAD" {
         let _ = write_simple_response(
             &mut socket,
@@ -147,7 +155,7 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let mut cached = match ytdlp::get_or_extract_stream(&state, video_id).await {
+    let mut cached = match ytdlp::get_or_extract_stream(&state, video_id, quality).await {
         Ok(c) => c,
         Err(err) => {
             let _ = write_simple_response(
@@ -165,7 +173,7 @@ async fn handle_connection(
     if let Ok(ref resp) = upstream_resp {
         if resp.status().as_u16() == 403 || resp.status().as_u16() == 410 {
             ytdlp::invalidate_stream_cache(&state, video_id).await;
-            if let Ok(fresh) = ytdlp::get_or_extract_stream(&state, video_id).await {
+            if let Ok(fresh) = ytdlp::get_or_extract_stream(&state, video_id, quality).await {
                 cached = fresh;
                 upstream_resp = send_upstream(&client, &method, &cached.direct_url, range_header.as_deref()).await;
             }

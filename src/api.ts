@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AudioQuality,
   EngineStatus,
   HomeSection,
   LyricsResponse,
@@ -8,6 +9,8 @@ import type {
   SongMetadata,
   StreamInfo,
   Track,
+  UpdateActionResult,
+  UpdateStatus,
 } from "./types";
 
 export async function searchMusic(
@@ -37,12 +40,18 @@ export async function getLyrics(
   });
 }
 
-export async function getStreamUrl(videoId: string): Promise<StreamInfo> {
-  return invoke<StreamInfo>("get_stream_url", { videoId });
+export async function getStreamUrl(
+  videoId: string,
+  quality: AudioQuality = "lossless"
+): Promise<StreamInfo> {
+  return invoke<StreamInfo>("get_stream_url", { videoId, quality });
 }
 
-export async function prefetchStream(videoId: string): Promise<void> {
-  return invoke<void>("prefetch_stream", { videoId });
+export async function prefetchStream(
+  videoId: string,
+  quality: AudioQuality = "lossless"
+): Promise<void> {
+  return invoke<void>("prefetch_stream", { videoId, quality });
 }
 
 export async function getRecommendations(videoId: string): Promise<Track[]> {
@@ -55,4 +64,12 @@ export async function getHomeDiscovery(): Promise<HomeSection[]> {
 
 export async function getEngineStatus(): Promise<EngineStatus> {
   return invoke<EngineStatus>("get_engine_status");
+}
+
+export async function checkForUpdates(): Promise<UpdateStatus> {
+  return invoke<UpdateStatus>("check_for_updates");
+}
+
+export async function runCoreUpdate(): Promise<UpdateActionResult> {
+  return invoke<UpdateActionResult>("run_core_update");
 }

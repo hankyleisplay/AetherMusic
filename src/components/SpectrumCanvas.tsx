@@ -3,10 +3,22 @@ import { useEffect, useRef } from "react";
 interface SpectrumCanvasProps {
   analyser: AnalyserNode | null;
   isPlaying: boolean;
+  variant?: "stage" | "wide" | "mini";
 }
 
-export function SpectrumCanvas({ analyser, isPlaying }: SpectrumCanvasProps) {
+export function SpectrumCanvas({
+  analyser,
+  isPlaying,
+  variant = "stage",
+}: SpectrumCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const dims =
+    variant === "mini"
+      ? { width: 96, height: 26, bars: 18, gap: 2 }
+      : variant === "wide"
+        ? { width: 520, height: 64, bars: 52, gap: 3 }
+        : { width: 320, height: 52, bars: 36, gap: 3 };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -15,7 +27,6 @@ export function SpectrumCanvas({ analyser, isPlaying }: SpectrumCanvasProps) {
     if (!ctx) return;
 
     let rafId = 0;
-    const barCount = 36;
     const dataArray = analyser ? new Uint8Array(analyser.frequencyBinCount) : null;
 
     const draw = () => {
@@ -23,35 +34,39 @@ export function SpectrumCanvas({ analyser, isPlaying }: SpectrumCanvasProps) {
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);
 
+      const style = getComputedStyle(document.documentElement);
+      const rgb1 = style.getPropertyValue("--accent-rgb-1").trim() || "124, 92, 255";
+      const rgb2 = style.getPropertyValue("--accent-rgb-2").trim() || "56, 189, 248";
+
       const grad = ctx.createLinearGradient(0, 0, w, 0);
-      grad.addColorStop(0, "#7c5cff");
-      grad.addColorStop(1, "#38bdf8");
+      grad.addColorStop(0, `rgb(${rgb1})`);
+      grad.addColorStop(1, `rgb(${rgb2})`);
       ctx.fillStyle = grad;
 
       if (analyser && dataArray && isPlaying) {
         analyser.getByteFrequencyData(dataArray);
       }
 
-      const gap = 3;
-      const barWidth = (w - gap * (barCount - 1)) / barCount;
+      const barCount = dims.bars;
+      const gap = dims.gap;
+      const barWidth = Math.max(2, (w - gap * (barCount - 1)) / barCount);
 
       for (let i = 0; i < barCount; i++) {
-        let ratio = 0.08;
+        let ratio = 0.1;
         if (isPlaying && analyser && dataArray) {
           const binIndex = Math.min(
             dataArray.length - 1,
-            Math.floor((i / barCount) * (dataArray.length * 0.65))
+            Math.floor((i / barCount) * (dataArray.length * 0.68))
           );
           const raw = dataArray[binIndex] / 255;
-          ratio = Math.max(0.08, raw);
+          ratio = Math.max(0.1, raw);
         } else if (isPlaying) {
-          // Subtle fallback pulse if analyser wasn't attached
-          ratio = 0.14 + 0.12 * Math.sin(Date.now() * 0.006 + i * 0.45);
+          ratio = 0.16 + 0.14 * Math.sin(Date.now() * 0.006 + i * 0.45);
         }
 
-        const barHeight = Math.max(4, ratio * (h - 8));
+        const barHeight = Math.max(3, ratio * (h - 4));
         const x = i * (barWidth + gap);
-        const y = (h - barHeight) / 2;
+        const y = variant === "wide" ? h - barHeight : (h - barHeight) / 2;
         const r = Math.min(3, barWidth / 2);
 
         ctx.beginPath();
@@ -68,14 +83,21 @@ export function SpectrumCanvas({ analyser, isPlaying }: SpectrumCanvasProps) {
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
     };
-  }, [analyser, isPlaying]);
+  }, [analyser, isPlaying, dims.bars, dims.gap, variant]);
+
+  const cls =
+    variant === "mini"
+      ? "visualizer-canvas mini"
+      : variant === "wide"
+        ? "visualizer-canvas wide"
+        : "visualizer-canvas";
 
   return (
     <canvas
       ref={canvasRef}
-      width={300}
-      height={48}
-      className="visualizer-canvas"
+      width={dims.width}
+      height={dims.height}
+      className={cls}
     />
   );
 }

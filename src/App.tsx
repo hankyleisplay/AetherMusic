@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowUpCircle,
   Compass,
   Disc3,
   Heart,
@@ -14,6 +15,7 @@ import {
   Pause,
   Play,
   Plus,
+  Radio,
   RefreshCw,
   Repeat,
   Repeat1,
@@ -30,6 +32,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  checkForUpdates,
   getEngineStatus,
   getHomeDiscovery,
   getLyrics,
@@ -37,12 +40,20 @@ import {
   getSongDetail,
   getStreamUrl,
   prefetchStream,
+  runCoreUpdate,
   searchMusic,
 } from "./api";
+import { AlbumArt } from "./components/AlbumArt";
+import { DJ_VIBES, DjMixConsole, type DjVibeOption } from "./components/DjMixConsole";
 import { SpectrumCanvas } from "./components/SpectrumCanvas";
+import { StartupSplash } from "./components/StartupSplash";
 import { TrackTable } from "./components/TrackTable";
 import type {
+  AudioQuality,
+  DjVibeId,
   EngineStatus,
+  EqSettings,
+  GlassMode,
   HomeSection,
   LyricsResponse,
   LyricsSourcePreference,
@@ -53,11 +64,14 @@ import type {
   SongMetadata,
   StreamInfo,
   Track,
+  UpdateStatus,
 } from "./types";
+import { buildFallbackCoverSvgDataUrl } from "./utils/artworkFallback";
+import { extractAlbumAccentRgb } from "./utils/colorExtract";
 
 const STORAGE_FAVS = "aethermusic_favorites_v1";
 const STORAGE_HISTORY = "aether_history_v1";
-const STORAGE_SETTINGS = "aethermusic_settings_v1";
+const STORAGE_SETTINGS = "aethermusic_settings_v2";
 
 const QUICK_GENRES = [
   "周杰倫",
@@ -93,7 +107,7 @@ function loadJsonStorage<T>(key: string, fallback: T): T {
 }
 
 export default function App() {
-  // Navigation & layout
+  const [showSplash, setShowSplash] = useState(true);
   const [navTab, setNavTab] = useState<NavTab>("home");
   const [sidePanelOpen, setSidePanelOpen] = useState(true);
   const [sideTab, setSideTab] = useState<SidePanelTab>("queue");
@@ -106,6 +120,24 @@ export default function App() {
   const [searchResults, setSearchResults] = useState<Track[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
 
+  // Persisted settings
+  const initialSettings = useMemo(
+    () =>
+      loadJsonStorage(STORAGE_SETTINGS, {
+        volume: 0.85,
+        autoRadio: true,
+        repeatMode: "off" as RepeatMode,
+        shuffle: false,
+        audioQuality: "lossless" as AudioQuality,
+        glassMode: "acrylic" as GlassMode,
+        crossfadeSec: 5,
+        djVoiceEnabled: true,
+        djVibe: "club" as DjVibeId,
+        eq: { low: 1.5, mid: 0.5, high: 2.5, preset: "hires" } as EqSettings,
+      }),
+    []
+  );
+
   // Queue & playback state
   const [queue, setQueue] = useState<Track[]>([]);
   const [currentIndex, setCurrentIndex] = useState<number>(-1);
@@ -115,22 +147,24 @@ export default function App() {
   const [duration, setDuration] = useState(0);
   const [streamInfo, setStreamInfo] = useState<StreamInfo | null>(null);
 
-  const initialSettings = useMemo(
-    () =>
-      loadJsonStorage(STORAGE_SETTINGS, {
-        volume: 0.85,
-        autoRadio: true,
-        repeatMode: "off" as RepeatMode,
-        shuffle: false,
-      }),
-    []
-  );
   const [volume, setVolume] = useState<number>(initialSettings.volume);
   const [muted, setMuted] = useState(false);
   const [autoRadio, setAutoRadio] = useState<boolean>(initialSettings.autoRadio);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>(initialSettings.repeatMode);
   const [shuffle, setShuffle] = useState<boolean>(initialSettings.shuffle);
+  const [audioQuality, setAudioQuality] = useState<AudioQuality>(initialSettings.audioQuality);
+  const [glassMode, setGlassMode] = useState<GlassMode>(initialSettings.glassMode);
   const [fetchingRecs, setFetchingRecs] = useState(false);
+
+  // AI DJ Mix state
+  const [djEnabled, setDjEnabled] = useState(false);
+  const [djVibe, setDjVibe] = useState<DjVibeId>(initialSettings.djVibe);
+  const [djLoading, setDjLoading] = useState(false);
+  const [djComment, setDjComment] = useState("");
+  const [djVoiceEnabled, setDjVoiceEnabled] = useState<boolean>(initialSettings.djVoiceEnabled);
+  const [crossfadeSec, setCrossfadeSec] = useState<number>(initialSettings.crossfadeSec);
+  const [crossfadeActive, setCrossfadeActive] = useState(false);
+  const [eq, setEq] = useState<EqSettings>(initialSettings.eq);
 
   // Song metadata & lyrics
   const [songDetail, setSongDetail] = useState<SongMetadata | null>(null);
@@ -139,7 +173,7 @@ export default function App() {
   const [lyricsSourcePref, setLyricsSourcePref] = useState<LyricsSourcePreference>("auto");
   const [lyricsOffset, setLyricsOffset] = useState<number>(0);
 
-  // Favorites, history, engine status, toast
+  // Library, Engine & Auto-Updater
   const [favorites, setFavorites] = useState<Track[]>(() =>
     loadJsonStorage<Track[]>(STORAGE_FAVS, [])
   );
@@ -147,21 +181,39 @@ export default function App() {
     loadJsonStorage<Track[]>(STORAGE_HISTORY, [])
   );
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updatingCore, setUpdatingCore] = useState(false);
   const [toast, setToast] = useState<{ message: string; isError?: boolean } | null>(null);
 
-  // Audio & WebAudio refs
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Dual-deck Audio & 32-bit Float DSP Web Audio refs
+  const audioARef = useRef<HTMLAudioElement | null>(null);
+  const audioBRef = useRef<HTMLAudioElement | null>(null);
+  const activeDeckRef = useRef<"A" | "B">("A");
+  const [activeDeck, setActiveDeck] = useState<"A" | "B">("A");
+
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const gainARef = useRef<GainNode | null>(null);
+  const gainBRef = useRef<GainNode | null>(null);
+  const lowFilterRef = useRef<BiquadFilterNode | null>(null);
+  const midFilterRef = useRef<BiquadFilterNode | null>(null);
+  const highFilterRef = useRef<BiquadFilterNode | null>(null);
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
 
-  // Mutable refs for async/event correctness
+  // Mutable refs for async/event accuracy
   const queueRef = useRef<Track[]>(queue);
   const currentIndexRef = useRef<number>(currentIndex);
   const autoRadioRef = useRef<boolean>(autoRadio);
   const repeatModeRef = useRef<RepeatMode>(repeatMode);
   const shuffleRef = useRef<boolean>(shuffle);
+  const qualityRef = useRef<AudioQuality>(audioQuality);
+  const djEnabledRef = useRef<boolean>(djEnabled);
+  const djVoiceRef = useRef<boolean>(djVoiceEnabled);
+  const crossfadeSecRef = useRef<number>(crossfadeSec);
+
   const playRequestIdRef = useRef<number>(0);
+  const crossfadeTriggeredReqRef = useRef<number>(-1);
+  const crossfadeCleanupTimerRef = useRef<number | null>(null);
   const playedIdsRef = useRef<Set<string>>(new Set());
   const recInFlightRef = useRef<boolean>(false);
 
@@ -173,8 +225,14 @@ export default function App() {
   autoRadioRef.current = autoRadio;
   repeatModeRef.current = repeatMode;
   shuffleRef.current = shuffle;
+  qualityRef.current = audioQuality;
+  djEnabledRef.current = djEnabled;
+  djVoiceRef.current = djVoiceEnabled;
+  crossfadeSecRef.current = crossfadeSec;
 
   const currentTrack = currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] : null;
+  const nextTrack =
+    currentIndex >= 0 && currentIndex + 1 < queue.length ? queue[currentIndex + 1] : null;
   const favoriteIds = useMemo(() => new Set(favorites.map((t) => t.videoId)), [favorites]);
 
   const showToast = useCallback((message: string, isError = false) => {
@@ -187,12 +245,26 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [toast]);
 
+  // Dynamic Acrylic Accent Extraction from Album Art
+  useEffect(() => {
+    if (!currentTrack?.thumbnailUrl) return;
+    let cancelled = false;
+    void extractAlbumAccentRgb(currentTrack.thumbnailUrl).then((colors) => {
+      if (cancelled || !colors) return;
+      document.documentElement.style.setProperty("--accent-rgb-1", colors[0]);
+      document.documentElement.style.setProperty("--accent-rgb-2", colors[1]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrack?.thumbnailUrl]);
+
   // Persist user library & settings
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_FAVS, JSON.stringify(favorites));
     } catch {
-      // ignore quota
+      // ignore
     }
   }, [favorites]);
 
@@ -200,7 +272,7 @@ export default function App() {
     try {
       localStorage.setItem(STORAGE_HISTORY, JSON.stringify(history));
     } catch {
-      // ignore quota
+      // ignore
     }
   }, [history]);
 
@@ -208,27 +280,204 @@ export default function App() {
     try {
       localStorage.setItem(
         STORAGE_SETTINGS,
-        JSON.stringify({ volume, autoRadio, repeatMode, shuffle })
+        JSON.stringify({
+          volume,
+          autoRadio,
+          repeatMode,
+          shuffle,
+          audioQuality,
+          glassMode,
+          crossfadeSec,
+          djVoiceEnabled,
+          djVibe,
+          eq,
+        })
       );
     } catch {
       // ignore
     }
-  }, [volume, autoRadio, repeatMode, shuffle]);
+  }, [
+    volume,
+    autoRadio,
+    repeatMode,
+    shuffle,
+    audioQuality,
+    glassMode,
+    crossfadeSec,
+    djVoiceEnabled,
+    djVibe,
+    eq,
+  ]);
 
   useEffect(() => {
-    if (audioRef.current) {
-      audioRef.current.volume = muted ? 0 : volume;
-    }
+    const v = muted ? 0 : volume;
+    if (audioARef.current) audioARef.current.volume = v;
+    if (audioBRef.current) audioBRef.current.volume = v;
   }, [volume, muted]);
+
+  // Sync live 3-band EQ parameters to Web Audio filters
+  useEffect(() => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    if (lowFilterRef.current) lowFilterRef.current.gain.setTargetAtTime(eq.low, now, 0.04);
+    if (midFilterRef.current) midFilterRef.current.gain.setTargetAtTime(eq.mid, now, 0.04);
+    if (highFilterRef.current) highFilterRef.current.gain.setTargetAtTime(eq.high, now, 0.04);
+  }, [eq]);
+
+  const getActiveAudio = useCallback(() => {
+    return activeDeckRef.current === "A" ? audioARef.current : audioBRef.current;
+  }, []);
+
+  const getStandbyDeck = useCallback((): "A" | "B" => {
+    return activeDeckRef.current === "A" ? "B" : "A";
+  }, []);
+
+  const ensureAudioGraph = useCallback(() => {
+    const aA = audioARef.current;
+    const aB = audioBRef.current;
+    if (!aA || !aB) return;
+
+    try {
+      if (!audioCtxRef.current) {
+        const Ctx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        if (!Ctx) return;
+
+        const ctx = new Ctx({ latencyHint: "playback" });
+
+        const low = ctx.createBiquadFilter();
+        low.type = "lowshelf";
+        low.frequency.value = 65;
+        low.gain.value = eq.low;
+
+        const mid = ctx.createBiquadFilter();
+        mid.type = "peaking";
+        mid.frequency.value = 2500;
+        mid.Q.value = 1.0;
+        mid.gain.value = eq.mid;
+
+        const high = ctx.createBiquadFilter();
+        high.type = "highshelf";
+        high.frequency.value = 12000;
+        high.gain.value = eq.high;
+
+        const limiter = ctx.createDynamicsCompressor();
+        limiter.threshold.value = -1.5;
+        limiter.knee.value = 6;
+        limiter.ratio.value = 4;
+        limiter.attack.value = 0.003;
+        limiter.release.value = 0.15;
+
+        const analyserNode = ctx.createAnalyser();
+        analyserNode.fftSize = 128;
+        analyserNode.smoothingTimeConstant = 0.82;
+
+        const gainA = ctx.createGain();
+        const gainB = ctx.createGain();
+        gainA.gain.value = activeDeckRef.current === "A" ? 1 : 0;
+        gainB.gain.value = activeDeckRef.current === "B" ? 1 : 0;
+
+        const srcA = ctx.createMediaElementSource(aA);
+        const srcB = ctx.createMediaElementSource(aB);
+
+        srcA.connect(gainA);
+        srcB.connect(gainB);
+        gainA.connect(low);
+        gainB.connect(low);
+
+        low.connect(mid);
+        mid.connect(high);
+        high.connect(limiter);
+        limiter.connect(analyserNode);
+        analyserNode.connect(ctx.destination);
+
+        audioCtxRef.current = ctx;
+        gainARef.current = gainA;
+        gainBRef.current = gainB;
+        lowFilterRef.current = low;
+        midFilterRef.current = mid;
+        highFilterRef.current = high;
+        setAnalyser(analyserNode);
+      }
+
+      if (audioCtxRef.current?.state === "suspended") {
+        void audioCtxRef.current.resume();
+      }
+    } catch {
+      // Fallback safely if Web Audio creation isn't supported
+    }
+  }, [eq.high, eq.low, eq.mid]);
+
+  const speakDjTransition = useCallback((track: Track, vibeLabel?: string) => {
+    const script = vibeLabel
+      ? `已切換至 ${vibeLabel}，接下來為您無縫混音播放 ${track.artist} 的 ${track.title}`
+      : `接下來無縫接歌，帶來 ${track.artist} 的 ${track.title}`;
+    setDjComment(script);
+
+    if (!djVoiceRef.current || typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return;
+    }
+    try {
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(script);
+      utter.lang = "zh-TW";
+      utter.rate = 1.04;
+      utter.pitch = 1.0;
+      utter.volume = 0.88;
+      window.speechSynthesis.speak(utter);
+    } catch {
+      // ignore speech synthesis errors on headless/unsupported webviews
+    }
+  }, []);
 
   const refreshEngineStatus = useCallback(async () => {
     try {
       const status = await getEngineStatus();
       setEngineStatus(status);
     } catch {
-      // ignore when running outside tauri preview
+      // ignore outside Tauri
     }
   }, []);
+
+  const handleCheckUpdates = useCallback(
+    async (silent = false) => {
+      setCheckingUpdate(true);
+      try {
+        const res = await checkForUpdates();
+        setUpdateStatus(res);
+        if (!silent) {
+          if (res.appUpdateAvailable || res.ytdlpUpdateAvailable) {
+            showToast("偵測到可用的新版本或串流核心更新！");
+          } else {
+            showToast("目前已是最新版本");
+          }
+        }
+      } catch (err) {
+        if (!silent) {
+          showToast(`檢查更新失敗: ${String(err)}`, true);
+        }
+      } finally {
+        setCheckingUpdate(false);
+      }
+    },
+    [showToast]
+  );
+
+  const handleRunCoreUpdate = useCallback(async () => {
+    setUpdatingCore(true);
+    try {
+      const res = await runCoreUpdate();
+      showToast(res.message, !res.success);
+      await refreshEngineStatus();
+      await handleCheckUpdates(true);
+    } catch (err) {
+      showToast(`更新失敗: ${String(err)}`, true);
+    } finally {
+      setUpdatingCore(false);
+    }
+  }, [handleCheckUpdates, refreshEngineStatus, showToast]);
 
   const loadHome = useCallback(async () => {
     setHomeLoading(true);
@@ -243,41 +492,14 @@ export default function App() {
   }, [showToast]);
 
   useEffect(() => {
-    refreshEngineStatus();
-    loadHome();
-  }, [refreshEngineStatus, loadHome]);
-
-  const ensureAudioGraph = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    try {
-      if (!audioCtxRef.current) {
-        const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        if (!Ctx) return;
-        const ctx = new Ctx();
-        const node = ctx.createAnalyser();
-        node.fftSize = 128;
-        node.smoothingTimeConstant = 0.82;
-        if (!sourceNodeRef.current) {
-          const src = ctx.createMediaElementSource(audio);
-          src.connect(node);
-          node.connect(ctx.destination);
-          sourceNodeRef.current = src;
-        }
-        audioCtxRef.current = ctx;
-        setAnalyser(node);
-      }
-      if (audioCtxRef.current?.state === "suspended") {
-        void audioCtxRef.current.resume();
-      }
-    } catch {
-      // Non-fatal fallback: audio continues without spectrum analyser
-    }
-  }, []);
+    void refreshEngineStatus();
+    void loadHome();
+    void handleCheckUpdates(true);
+  }, [refreshEngineStatus, loadHome, handleCheckUpdates]);
 
   const appendRecommendations = useCallback(
     async (seedVideoId: string, autoPlayFirstNew = false): Promise<boolean> => {
-      if (recInFlightRef.current) return false;
+      if (recInFlightRef.current || seedVideoId.startsWith("local-")) return false;
       recInFlightRef.current = true;
       setFetchingRecs(true);
       try {
@@ -299,12 +521,13 @@ export default function App() {
         queueRef.current = nextQueue;
         setQueue(nextQueue);
 
-        // Prefetch the very next recommended track
-        prefetchStream(toAdd[0].videoId).catch(() => {});
+        if (!toAdd[0].localFileUrl) {
+          prefetchStream(toAdd[0].videoId, qualityRef.current).catch(() => {});
+        }
 
         if (autoPlayFirstNew) {
           setTimeout(() => {
-            void playIndexRef.current(startNewIndex);
+            void playIndexRef.current(startNewIndex, false);
           }, 0);
         } else {
           showToast(`✨ 已透過 YTMAPI 自動推薦加入 ${toAdd.length} 首相關歌曲`);
@@ -325,6 +548,19 @@ export default function App() {
 
   const loadMetadataAndLyrics = useCallback(
     async (track: Track, reqId: number, pref: LyricsSourcePreference) => {
+      if (track.localFileUrl || track.videoId.startsWith("local-")) {
+        setSongDetail(null);
+        setLyrics({
+          videoId: track.videoId,
+          syncedLines: [],
+          plainText: `本機無損音檔播放中\n檔案名稱：${track.title}`,
+          source: "Local Lossless",
+          hasSynced: false,
+        });
+        setLyricsLoading(false);
+        return;
+      }
+
       setLyricsLoading(true);
       setLyricsOffset(0);
 
@@ -363,13 +599,24 @@ export default function App() {
     []
   );
 
+  const cancelPendingCrossfade = useCallback(() => {
+    if (crossfadeCleanupTimerRef.current !== null) {
+      window.clearTimeout(crossfadeCleanupTimerRef.current);
+      crossfadeCleanupTimerRef.current = null;
+    }
+    setCrossfadeActive(false);
+  }, []);
+
   const playQueueIndex = useCallback(
-    async (idx: number) => {
+    async (idx: number, useCrossfade = false) => {
       const targetQueue = queueRef.current;
       if (idx < 0 || idx >= targetQueue.length) return;
       const track = targetQueue[idx];
 
+      cancelPendingCrossfade();
+
       const reqId = ++playRequestIdRef.current;
+      crossfadeTriggeredReqRef.current = -1;
       currentIndexRef.current = idx;
       setCurrentIndex(idx);
       setIsBuffering(true);
@@ -379,37 +626,118 @@ export default function App() {
       setSongDetail(null);
 
       playedIdsRef.current.add(track.videoId);
-      setHistory((prev) => [
-        track,
-        ...prev.filter((t) => t.videoId !== track.videoId),
-      ].slice(0, 80));
+      setHistory((prev) => [track, ...prev.filter((t) => t.videoId !== track.videoId)].slice(0, 80));
 
-      // Fire metadata & lyrics in parallel
       void loadMetadataAndLyrics(track, reqId, lyricsSourcePref);
 
-      // Proactive Auto-Radio prefetch when approaching end of queue
       const remaining = targetQueue.length - 1 - idx;
-      if (autoRadioRef.current && remaining <= 1) {
+      if (autoRadioRef.current && remaining <= 1 && !track.localFileUrl) {
         void appendRecommendations(track.videoId, false);
-      } else if (idx + 1 < targetQueue.length) {
-        prefetchStream(targetQueue[idx + 1].videoId).catch(() => {});
+      } else if (idx + 1 < targetQueue.length && !targetQueue[idx + 1].localFileUrl) {
+        prefetchStream(targetQueue[idx + 1].videoId, qualityRef.current).catch(() => {});
       }
 
       try {
-        const info = await getStreamUrl(track.videoId);
-        if (playRequestIdRef.current !== reqId) return;
-        setStreamInfo(info);
+        let playUrl = track.localFileUrl || "";
+        if (track.localFileUrl) {
+          setStreamInfo({
+            videoId: track.videoId,
+            proxyUrl: track.localFileUrl,
+            directUrl: track.localFileUrl,
+            mimeType: "audio/flac",
+            acodec: "Local Lossless",
+            abr: "Native",
+            sampleRate: "48+ kHz",
+            bitDepth: "24/32-bit Lossless",
+            qualityLabel: "本機無損母帶",
+            engineUsed: "local-file",
+          });
+        } else {
+          const info = await getStreamUrl(track.videoId, qualityRef.current);
+          if (playRequestIdRef.current !== reqId) return;
+          setStreamInfo(info);
+          playUrl = info.proxyUrl;
+        }
 
-        const audio = audioRef.current;
-        if (audio) {
-          ensureAudioGraph();
-          audio.src = info.proxyUrl;
-          audio.currentTime = 0;
-          await audio.play();
-          if (playRequestIdRef.current === reqId) {
-            setIsPlaying(true);
-            setIsBuffering(false);
+        ensureAudioGraph();
+
+        const outgoingDeck = activeDeckRef.current;
+        const incomingDeck = useCrossfade ? getStandbyDeck() : outgoingDeck;
+        const outAudio = outgoingDeck === "A" ? audioARef.current : audioBRef.current;
+        const inAudio = incomingDeck === "A" ? audioARef.current : audioBRef.current;
+        const outGain = outgoingDeck === "A" ? gainARef.current : gainBRef.current;
+        const inGain = incomingDeck === "A" ? gainARef.current : gainBRef.current;
+
+        if (!inAudio) return;
+
+        // If hard cut, stop standby deck immediately
+        if (!useCrossfade) {
+          const otherAudio = outgoingDeck === "A" ? audioBRef.current : audioARef.current;
+          const otherGain = outgoingDeck === "A" ? gainBRef.current : gainARef.current;
+          if (otherAudio) {
+            otherAudio.pause();
+            otherAudio.currentTime = 0;
           }
+          if (audioCtxRef.current && outGain && otherGain) {
+            const t = audioCtxRef.current.currentTime;
+            outGain.gain.cancelScheduledValues(t);
+            outGain.gain.setValueAtTime(1, t);
+            otherGain.gain.cancelScheduledValues(t);
+            otherGain.gain.setValueAtTime(0, t);
+          }
+        }
+
+        activeDeckRef.current = incomingDeck;
+        setActiveDeck(incomingDeck);
+
+        inAudio.src = playUrl;
+        inAudio.currentTime = 0;
+
+        if (useCrossfade && audioCtxRef.current && outGain && inGain && incomingDeck !== outgoingDeck) {
+          const fadeDur = Math.max(1.5, Math.min(12, crossfadeSecRef.current));
+          const now = audioCtxRef.current.currentTime;
+
+          inGain.gain.cancelScheduledValues(now);
+          inGain.gain.setValueAtTime(0.001, now);
+          inGain.gain.linearRampToValueAtTime(1, now + fadeDur);
+
+          outGain.gain.cancelScheduledValues(now);
+          outGain.gain.setValueAtTime(outGain.gain.value || 1, now);
+          outGain.gain.linearRampToValueAtTime(0.001, now + fadeDur);
+
+          // Subtle DJ Bass-Swap dip during transition
+          if (lowFilterRef.current) {
+            lowFilterRef.current.gain.setTargetAtTime(eq.low - 4, now, 0.25);
+            lowFilterRef.current.gain.setTargetAtTime(eq.low, now + fadeDur * 0.65, 0.35);
+          }
+
+          setCrossfadeActive(true);
+          if (djEnabledRef.current) {
+            speakDjTransition(track);
+          }
+
+          await inAudio.play();
+          if (playRequestIdRef.current !== reqId) return;
+          setIsPlaying(true);
+          setIsBuffering(false);
+
+          crossfadeCleanupTimerRef.current = window.setTimeout(() => {
+            if (outAudio) {
+              outAudio.pause();
+              outAudio.currentTime = 0;
+            }
+            setCrossfadeActive(false);
+          }, fadeDur * 1000 + 80);
+        } else {
+          if (audioCtxRef.current && inGain) {
+            const now = audioCtxRef.current.currentTime;
+            inGain.gain.cancelScheduledValues(now);
+            inGain.gain.setValueAtTime(1, now);
+          }
+          await inAudio.play();
+          if (playRequestIdRef.current !== reqId) return;
+          setIsPlaying(true);
+          setIsBuffering(false);
         }
       } catch (err) {
         if (playRequestIdRef.current !== reqId) return;
@@ -418,7 +746,17 @@ export default function App() {
         showToast(`串流播放失敗 (${track.title}): ${String(err)}`, true);
       }
     },
-    [appendRecommendations, ensureAudioGraph, loadMetadataAndLyrics, lyricsSourcePref, showToast]
+    [
+      appendRecommendations,
+      cancelPendingCrossfade,
+      ensureAudioGraph,
+      eq.low,
+      getStandbyDeck,
+      loadMetadataAndLyrics,
+      lyricsSourcePref,
+      showToast,
+      speakDjTransition,
+    ]
   );
 
   const playIndexRef = useRef(playQueueIndex);
@@ -432,18 +770,18 @@ export default function App() {
         const targetIdx = foundIdx >= 0 ? foundIdx : 0;
         queueRef.current = nextQueue;
         setQueue(nextQueue);
-        void playQueueIndex(targetIdx);
+        void playQueueIndex(targetIdx, false);
       } else {
         const existingIdx = queueRef.current.findIndex((t) => t.videoId === track.videoId);
         if (existingIdx >= 0) {
-          void playQueueIndex(existingIdx);
+          void playQueueIndex(existingIdx, false);
           return;
         }
         const nextQueue = [...queueRef.current, { ...track, isAutoRecommended: false }];
         const targetIdx = nextQueue.length - 1;
         queueRef.current = nextQueue;
         setQueue(nextQueue);
-        void playQueueIndex(targetIdx);
+        void playQueueIndex(targetIdx, false);
       }
     },
     [playQueueIndex]
@@ -461,15 +799,13 @@ export default function App() {
           return next;
         }
         const insertAt = Math.min(curIdx + 1, filtered.length);
-        const next = [
-          ...filtered.slice(0, insertAt),
-          cleanTrack,
-          ...filtered.slice(insertAt),
-        ];
+        const next = [...filtered.slice(0, insertAt), cleanTrack, ...filtered.slice(insertAt)];
         queueRef.current = next;
         return next;
       });
-      prefetchStream(cleanTrack.videoId).catch(() => {});
+      if (!cleanTrack.localFileUrl) {
+        prefetchStream(cleanTrack.videoId, qualityRef.current).catch(() => {});
+      }
       showToast(`已排入下一首播放: ${cleanTrack.title}`);
     },
     [showToast]
@@ -512,13 +848,17 @@ export default function App() {
           currentIndexRef.current = -1;
           setCurrentIndex(-1);
           setIsPlaying(false);
-          if (audioRef.current) {
-            audioRef.current.pause();
-            audioRef.current.src = "";
+          if (audioARef.current) {
+            audioARef.current.pause();
+            audioARef.current.src = "";
+          }
+          if (audioBRef.current) {
+            audioBRef.current.pause();
+            audioBRef.current.src = "";
           }
         } else {
           const nextIdx = Math.min(idx, next.length - 1);
-          setTimeout(() => void playIndexRef.current(nextIdx), 0);
+          setTimeout(() => void playIndexRef.current(nextIdx, false), 0);
         }
       }
       return next;
@@ -553,40 +893,43 @@ export default function App() {
     });
   }, []);
 
-  const handleNext = useCallback(async () => {
-    const q = queueRef.current;
-    const cur = currentIndexRef.current;
-    if (q.length === 0) return;
+  const handleNext = useCallback(
+    async (allowCrossfade = false) => {
+      const q = queueRef.current;
+      const cur = currentIndexRef.current;
+      if (q.length === 0) return;
 
-    if (shuffleRef.current && q.length > 1) {
-      let rand = Math.floor(Math.random() * q.length);
-      if (rand === cur) {
-        rand = (cur + 1) % q.length;
+      if (shuffleRef.current && q.length > 1) {
+        let rand = Math.floor(Math.random() * q.length);
+        if (rand === cur) {
+          rand = (cur + 1) % q.length;
+        }
+        await playQueueIndex(rand, allowCrossfade);
+        return;
       }
-      await playQueueIndex(rand);
-      return;
-    }
 
-    if (cur + 1 < q.length) {
-      await playQueueIndex(cur + 1);
-      return;
-    }
+      if (cur + 1 < q.length) {
+        await playQueueIndex(cur + 1, allowCrossfade);
+        return;
+      }
 
-    if (autoRadioRef.current && cur >= 0 && q[cur]) {
-      showToast("佇列已播完，正在為您自動推薦相關音樂...");
-      const added = await appendRecommendations(q[cur].videoId, true);
-      if (added) return;
-    }
+      if (autoRadioRef.current && cur >= 0 && q[cur] && !q[cur].localFileUrl) {
+        showToast("佇列已播完，正在為您自動推薦相關音樂...");
+        const added = await appendRecommendations(q[cur].videoId, true);
+        if (added) return;
+      }
 
-    if (repeatModeRef.current === "all") {
-      await playQueueIndex(0);
-    } else {
-      setIsPlaying(false);
-    }
-  }, [appendRecommendations, playQueueIndex, showToast]);
+      if (repeatModeRef.current === "all") {
+        await playQueueIndex(0, allowCrossfade);
+      } else {
+        setIsPlaying(false);
+      }
+    },
+    [appendRecommendations, playQueueIndex, showToast]
+  );
 
   const handlePrev = useCallback(() => {
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (audio && audio.currentTime > 4) {
       audio.currentTime = 0;
       setCurrentTime(0);
@@ -596,18 +939,18 @@ export default function App() {
     const cur = currentIndexRef.current;
     if (q.length === 0) return;
     if (cur > 0) {
-      void playQueueIndex(cur - 1);
+      void playQueueIndex(cur - 1, false);
     } else if (repeatModeRef.current === "all") {
-      void playQueueIndex(q.length - 1);
+      void playQueueIndex(q.length - 1, false);
     }
-  }, [playQueueIndex]);
+  }, [getActiveAudio, playQueueIndex]);
 
   const togglePlayPause = useCallback(async () => {
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (!audio) return;
     if (!currentTrack) {
       if (queueRef.current.length > 0) {
-        await playQueueIndex(0);
+        await playQueueIndex(0, false);
       }
       return;
     }
@@ -623,20 +966,129 @@ export default function App() {
       audio.pause();
       setIsPlaying(false);
     }
-  }, [currentTrack, ensureAudioGraph, playQueueIndex]);
+  }, [currentTrack, ensureAudioGraph, getActiveAudio, playQueueIndex]);
 
-  const handleTrackEnded = useCallback(async () => {
-    if (repeatModeRef.current === "one") {
-      const audio = audioRef.current;
-      if (audio) {
-        audio.currentTime = 0;
-        await audio.play().catch(() => {});
-        setIsPlaying(true);
+  const handleTrackEnded = useCallback(
+    async (deck: "A" | "B") => {
+      if (deck !== activeDeckRef.current) return;
+      if (repeatModeRef.current === "one") {
+        const audio = getActiveAudio();
+        if (audio) {
+          audio.currentTime = 0;
+          await audio.play().catch(() => {});
+          setIsPlaying(true);
+        }
+        return;
       }
-      return;
+      await handleNext(false);
+    },
+    [getActiveAudio, handleNext]
+  );
+
+  const handleTimeUpdateForDeck = useCallback(
+    (deck: "A" | "B", audioEl: HTMLAudioElement) => {
+      if (deck !== activeDeckRef.current) return;
+      const curTime = audioEl.currentTime;
+      const dur = audioEl.duration;
+      setCurrentTime(curTime);
+
+      // Automatic Crossfade transition before track end when DJ Mode or Crossfade > 0
+      const effectiveFade = djEnabledRef.current
+        ? Math.max(3, crossfadeSecRef.current)
+        : crossfadeSecRef.current;
+
+      if (
+        effectiveFade > 0 &&
+        Number.isFinite(dur) &&
+        dur > effectiveFade + 5 &&
+        repeatModeRef.current !== "one"
+      ) {
+        const remaining = dur - curTime;
+        if (
+          remaining <= effectiveFade &&
+          remaining > 0.4 &&
+          crossfadeTriggeredReqRef.current !== playRequestIdRef.current
+        ) {
+          const q = queueRef.current;
+          const idx = currentIndexRef.current;
+          if (idx + 1 < q.length) {
+            crossfadeTriggeredReqRef.current = playRequestIdRef.current;
+            void playQueueIndex(idx + 1, true);
+          }
+        }
+      }
+    },
+    [playQueueIndex]
+  );
+
+  const startDjVibe = useCallback(
+    async (vibe: DjVibeOption) => {
+      setDjVibe(vibe.id);
+      setDjEnabled(true);
+      setAutoRadio(true);
+      if (crossfadeSecRef.current === 0) {
+        setCrossfadeSec(5);
+      }
+      setDjLoading(true);
+      try {
+        const tracks = await searchMusic(vibe.query, "songs");
+        if (tracks.length === 0) {
+          showToast("暫時找不到此 DJ 風格曲目", true);
+          return;
+        }
+        const shuffled = [...tracks].sort(() => Math.random() - 0.5);
+        const djQueue = shuffled.map((t) => ({ ...t, isAutoRecommended: true }));
+        queueRef.current = djQueue;
+        setQueue(djQueue);
+        speakDjTransition(djQueue[0], vibe.label);
+        await playQueueIndex(0, isPlaying);
+      } catch (err) {
+        showToast(`啟動 AI DJ Mix 失敗: ${String(err)}`, true);
+      } finally {
+        setDjLoading(false);
+      }
+    },
+    [isPlaying, playQueueIndex, showToast, speakDjTransition]
+  );
+
+  const handleToggleDj = useCallback(() => {
+    if (djEnabled) {
+      setDjEnabled(false);
+      showToast("已關閉 AI DJ Mix 自動混音");
+    } else {
+      const vibe = DJ_VIBES.find((v) => v.id === djVibe) ?? DJ_VIBES[0];
+      void startDjVibe(vibe);
     }
-    await handleNext();
-  }, [handleNext]);
+  }, [djEnabled, djVibe, showToast, startDjVibe]);
+
+  const handleImportLocalLossless = useCallback(
+    (files: FileList | null) => {
+      if (!files || files.length === 0) return;
+      const imported: Track[] = Array.from(files).map((file, idx) => {
+        const cleanName = file.name.replace(/\.[^.]+$/, "");
+        return {
+          videoId: `local-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+          title: cleanName,
+          artist: "本機無損音檔",
+          album: file.name.split(".").pop()?.toUpperCase() || "LOSSLESS",
+          durationText: "Local",
+          durationSeconds: 0,
+          thumbnailUrl: currentTrack?.thumbnailUrl || "",
+          isAutoRecommended: false,
+          localFileUrl: URL.createObjectURL(file),
+          isLosslessLocal: true,
+        };
+      });
+
+      const startIdx = queueRef.current.length;
+      const nextQueue = [...queueRef.current, ...imported];
+      queueRef.current = nextQueue;
+      setQueue(nextQueue);
+      showToast(`已匯入 ${imported.length} 首本機無損音檔`);
+      void playQueueIndex(startIdx, false);
+    },
+    [currentTrack?.thumbnailUrl, playQueueIndex, showToast]
+  );
 
   const handleSearchSubmit = useCallback(
     async (e?: React.FormEvent, overrideQuery?: string, overrideFilter?: SearchFilter) => {
@@ -662,7 +1114,7 @@ export default function App() {
   const handleSwitchLyricsSource = useCallback(
     async (pref: LyricsSourcePreference) => {
       setLyricsSourcePref(pref);
-      if (!currentTrack) return;
+      if (!currentTrack || currentTrack.localFileUrl) return;
       const reqId = playRequestIdRef.current;
       setLyricsLoading(true);
       try {
@@ -685,13 +1137,16 @@ export default function App() {
     [currentTrack]
   );
 
-  const seekTo = useCallback((sec: number) => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    const clamped = Math.max(0, Math.min(sec, audio.duration || sec));
-    audio.currentTime = clamped;
-    setCurrentTime(clamped);
-  }, []);
+  const seekTo = useCallback(
+    (sec: number) => {
+      const audio = getActiveAudio();
+      if (!audio) return;
+      const clamped = Math.max(0, Math.min(sec, audio.duration || sec));
+      audio.currentTime = clamped;
+      setCurrentTime(clamped);
+    },
+    [getActiveAudio]
+  );
 
   const cycleRepeatMode = useCallback(() => {
     setRepeatMode((prev) => (prev === "off" ? "all" : prev === "all" ? "one" : "off"));
@@ -701,7 +1156,7 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
-      if (tag === "input" || tag === "textarea") return;
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
 
       if (e.code === "Space") {
         e.preventDefault();
@@ -747,36 +1202,86 @@ export default function App() {
   const volumePct = (muted ? 0 : volume) * 100;
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-glass={glassMode}>
+      {showSplash && <StartupSplash onFinish={() => setShowSplash(false)} />}
+
+      <div className="aurora-mesh" />
       <div
         className="ambient-backdrop"
         style={{
-          backgroundImage: currentTrack?.thumbnailUrl
-            ? `url("${currentTrack.thumbnailUrl}")`
+          backgroundImage: currentTrack
+            ? `url("${currentTrack.thumbnailUrl || buildFallbackCoverSvgDataUrl(currentTrack.title, currentTrack.artist, currentTrack.videoId)}")`
             : undefined,
         }}
       />
 
+      {/* Dual-Deck Audio Elements for Seamless Crossfade */}
       <audio
-        ref={audioRef}
+        ref={audioARef}
         crossOrigin="anonymous"
         preload="auto"
-        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+        onTimeUpdate={(e) => handleTimeUpdateForDeck("A", e.currentTarget)}
         onDurationChange={(e) => {
-          const d = e.currentTarget.duration;
-          if (Number.isFinite(d) && d > 0) setDuration(d);
+          if (activeDeckRef.current === "A") {
+            const d = e.currentTarget.duration;
+            if (Number.isFinite(d) && d > 0) setDuration(d);
+          }
         }}
         onPlaying={() => {
-          setIsPlaying(true);
-          setIsBuffering(false);
+          if (activeDeckRef.current === "A") {
+            setIsPlaying(true);
+            setIsBuffering(false);
+          }
         }}
-        onPause={() => setIsPlaying(false)}
-        onWaiting={() => setIsBuffering(true)}
-        onCanPlay={() => setIsBuffering(false)}
-        onEnded={() => void handleTrackEnded()}
+        onPause={() => {
+          if (activeDeckRef.current === "A" && !crossfadeActive) setIsPlaying(false);
+        }}
+        onWaiting={() => {
+          if (activeDeckRef.current === "A") setIsBuffering(true);
+        }}
+        onCanPlay={() => {
+          if (activeDeckRef.current === "A") setIsBuffering(false);
+        }}
+        onEnded={() => void handleTrackEnded("A")}
         onError={() => {
-          setIsBuffering(false);
-          setIsPlaying(false);
+          if (activeDeckRef.current === "A") {
+            setIsBuffering(false);
+            setIsPlaying(false);
+          }
+        }}
+      />
+      <audio
+        ref={audioBRef}
+        crossOrigin="anonymous"
+        preload="auto"
+        onTimeUpdate={(e) => handleTimeUpdateForDeck("B", e.currentTarget)}
+        onDurationChange={(e) => {
+          if (activeDeckRef.current === "B") {
+            const d = e.currentTarget.duration;
+            if (Number.isFinite(d) && d > 0) setDuration(d);
+          }
+        }}
+        onPlaying={() => {
+          if (activeDeckRef.current === "B") {
+            setIsPlaying(true);
+            setIsBuffering(false);
+          }
+        }}
+        onPause={() => {
+          if (activeDeckRef.current === "B" && !crossfadeActive) setIsPlaying(false);
+        }}
+        onWaiting={() => {
+          if (activeDeckRef.current === "B") setIsBuffering(true);
+        }}
+        onCanPlay={() => {
+          if (activeDeckRef.current === "B") setIsBuffering(false);
+        }}
+        onEnded={() => void handleTrackEnded("B")}
+        onError={() => {
+          if (activeDeckRef.current === "B") {
+            setIsBuffering(false);
+            setIsPlaying(false);
+          }
         }}
       />
 
@@ -789,12 +1294,12 @@ export default function App() {
             </div>
             <div className="brand-title-group">
               <div className="brand-name truncate">AetherMusic</div>
-              <div className="brand-sub truncate">Tauri + Rust Cloud Player</div>
+              <div className="brand-sub truncate">Hi-Res · AI DJ · Cross-Platform</div>
             </div>
           </div>
 
           <nav className="nav-section">
-            <div className="nav-section-label">探索與串流</div>
+            <div className="nav-section-label">探索與混音</div>
             <button
               type="button"
               className={`nav-item ${navTab === "home" ? "active" : ""}`}
@@ -813,6 +1318,17 @@ export default function App() {
             </button>
             <button
               type="button"
+              className={`nav-item ${navTab === "dj" ? "active" : ""}`}
+              onClick={() => setNavTab("dj")}
+            >
+              <Radio size={17} />
+              <span className="truncate">AI DJ Mix</span>
+              <span className={`nav-badge ${djEnabled ? "dj" : ""}`}>
+                {djEnabled ? "LIVE" : "DJ"}
+              </span>
+            </button>
+            <button
+              type="button"
               className={`nav-item ${navTab === "lyrics" ? "active" : ""}`}
               onClick={() => setNavTab("lyrics")}
             >
@@ -823,7 +1339,7 @@ export default function App() {
           </nav>
 
           <nav className="nav-section">
-            <div className="nav-section-label">媒體與清單</div>
+            <div className="nav-section-label">媒體與系統</div>
             <button
               type="button"
               className={`nav-item ${navTab === "queue" ? "active" : ""}`}
@@ -848,7 +1364,10 @@ export default function App() {
               onClick={() => setNavTab("settings")}
             >
               <Settings size={17} />
-              <span className="truncate">引擎與授權</span>
+              <span className="truncate">音質・更新・授權</span>
+              {(updateStatus?.appUpdateAvailable || updateStatus?.ytdlpUpdateAvailable) && (
+                <span className="nav-badge dj">NEW</span>
+              )}
             </button>
           </nav>
 
@@ -856,21 +1375,23 @@ export default function App() {
             <div className="status-row">
               <div className="status-dot-wrap">
                 <span className={`status-dot ${engineStatus?.ytmapiReady !== false ? "ok" : "warn"}`} />
-                <span className="truncate">YTMAPI 資訊引擎</span>
+                <span className="truncate">YTMAPI / InnerTube</span>
               </div>
               <span style={{ color: "#10b981", fontWeight: 600 }}>就緒</span>
             </div>
             <div className="status-row">
               <div className="status-dot-wrap">
-                <span className={`status-dot ${engineStatus?.ytdlpAvailable ? "ok" : "warn"}`} />
-                <span className="truncate">yt-dlp 串流</span>
+                <span className="status-dot ok" />
+                <span className="truncate">
+                  {engineStatus?.ytdlpAvailable ? "yt-dlp 串流" : "純 Rust 串流"}
+                </span>
               </div>
-              <span className="truncate" style={{ maxWidth: 74, color: "var(--text-muted)" }}>
-                {engineStatus?.ytdlpAvailable ? engineStatus.ytdlpVersion : "自動偵測"}
+              <span className="truncate" style={{ maxWidth: 74, color: "var(--text-secondary)" }}>
+                {engineStatus?.ytdlpAvailable ? engineStatus.ytdlpVersion : engineStatus?.platform || "active"}
               </span>
             </div>
             <div className="status-row" style={{ fontSize: 10.5, color: "var(--text-muted)" }}>
-              <span>GPL-3.0 Licensed</span>
+              <span>GPL-3.0 · Deck {activeDeck}</span>
               <span className="tabular-nums">
                 {engineStatus?.proxyPort ? `:${engineStatus.proxyPort}` : ""}
               </span>
@@ -886,7 +1407,7 @@ export default function App() {
               <input
                 type="text"
                 className="search-input"
-                placeholder="搜尋歌曲、藝人、專輯或貼上關鍵字 (透過 YTMAPI)..."
+                placeholder="搜尋歌曲、藝人或關鍵字 (YTMAPI)..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
               />
@@ -908,12 +1429,41 @@ export default function App() {
             <div className="header-actions">
               <button
                 type="button"
-                className={`icon-pill-btn ${autoRadio ? "active" : ""}`}
-                onClick={() => setAutoRadio((v) => !v)}
-                title="佇列歌曲播完後自動透過 YTMAPI 推薦並接續播放"
+                className={`icon-pill-btn ${audioQuality === "lossless" ? "active" : ""}`}
+                onClick={() => {
+                  const next: AudioQuality =
+                    audioQuality === "lossless"
+                      ? "high"
+                      : audioQuality === "high"
+                        ? "standard"
+                        : "lossless";
+                  setAudioQuality(next);
+                  showToast(
+                    next === "lossless"
+                      ? "已切換為 Hi-Res 無損母帶 DSP 模式"
+                      : next === "high"
+                        ? "已切換為極高音質模式"
+                        : "已切換為標準省流模式"
+                  );
+                }}
+                title="切換音質檔位 (Hi-Res 無損 / 極高 / 標準)"
               >
-                <Sparkles size={14} />
-                <span>自動推薦 {autoRadio ? "開" : "關"}</span>
+                <Sparkles size={13} />
+                <span>
+                  {audioQuality === "lossless"
+                    ? "Hi-Res 無損"
+                    : audioQuality === "high"
+                      ? "極高音質"
+                      : "標準省流"}
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`icon-pill-btn ${glassMode === "acrylic" ? "active" : ""}`}
+                onClick={() => setGlassMode((m) => (m === "acrylic" ? "lite" : "acrylic"))}
+                title="切換絢麗毛玻璃 / 極致省電模式"
+              >
+                <span>{glassMode === "acrylic" ? "毛玻璃: 絢麗" : "毛玻璃: 省電"}</span>
               </button>
               <button
                 type="button"
@@ -943,71 +1493,61 @@ export default function App() {
                   <div style={{ minWidth: 0 }}>
                     <div className="hero-eyebrow">
                       <Compass size={14} />
-                      <span>YT-DLP 雲端音訊串流 × YTMAPI 智慧曲庫</span>
+                      <span>HI-RES 無損 DSP × SPOTIFY AI DJ MIX × 低耗能毛玻璃</span>
                     </div>
                     <h1 className="hero-title truncate">
                       {currentTrack ? `正在聆聽：${currentTrack.title}` : "探索無界雲端音樂"}
                     </h1>
                     <p className="hero-desc">
                       {currentTrack
-                        ? `${currentTrack.artist}${currentTrack.album ? ` · ${currentTrack.album}` : ""} — 自動推薦引擎已就緒，佇列播完將無縫延續相關曲風。`
-                        : "點擊任意歌曲即可透過 yt-dlp + 本地 Range 代理即時串流播放，搭配時間軸同步歌詞與自動相關推薦電台。"}
+                        ? `${currentTrack.artist}${streamInfo ? ` · ${streamInfo.qualityLabel} (${streamInfo.acodec})` : ""}`
+                        : "支援 yt-dlp + 純 Rust InnerTube 跨平臺串流、無縫 DJ Crossfade 混音、時間軸同步歌詞與即時動態頻譜。"}
                     </p>
                     <div className="hero-actions">
+                      <button
+                        type="button"
+                        className="primary-btn"
+                        onClick={() => {
+                          if (!djEnabled) {
+                            setNavTab("dj");
+                            handleToggleDj();
+                          } else {
+                            setNavTab("dj");
+                          }
+                        }}
+                      >
+                        <Radio size={15} />
+                        {djEnabled ? "前往 AI DJ 混音台" : "啟動 AI DJ 連播"}
+                      </button>
                       {currentTrack ? (
-                        <>
-                          <button
-                            type="button"
-                            className="primary-btn"
-                            onClick={() => setNavTab("lyrics")}
-                          >
-                            <Mic2 size={15} />
-                            進入沉浸式歌詞
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary-btn"
-                            onClick={() => void appendRecommendations(currentTrack.videoId, false)}
-                            disabled={fetchingRecs}
-                          >
-                            <Sparkles size={15} />
-                            {fetchingRecs ? "載入推薦中..." : "擴充相關推薦"}
-                          </button>
-                        </>
+                        <button
+                          type="button"
+                          className="secondary-btn"
+                          onClick={() => setNavTab("lyrics")}
+                        >
+                          <Mic2 size={15} />
+                          動態歌詞與頻譜
+                        </button>
                       ) : (
-                        <>
-                          <button
-                            type="button"
-                            className="primary-btn"
-                            onClick={() => {
-                              const firstSection = homeSections[0];
-                              if (firstSection?.tracks.length) {
-                                playTrackFromList(firstSection.tracks[0], firstSection.tracks);
-                              }
-                            }}
-                            disabled={homeSections.length === 0}
-                          >
-                            <Play size={15} fill="currentColor" />
-                            立即隨機啟播
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary-btn"
-                            onClick={() => void loadHome()}
-                            disabled={homeLoading}
-                          >
-                            <RefreshCw size={15} className={homeLoading ? "spin" : ""} />
-                            重新整理精選
-                          </button>
-                        </>
+                        <button
+                          type="button"
+                          className="secondary-btn"
+                          onClick={() => void loadHome()}
+                          disabled={homeLoading}
+                        >
+                          <RefreshCw size={15} className={homeLoading ? "spin" : ""} />
+                          重新整理精選
+                        </button>
                       )}
                     </div>
                   </div>
 
-                  {currentTrack?.thumbnailUrl && (
-                    <img
-                      src={currentTrack.thumbnailUrl}
-                      alt={currentTrack.title}
+                  {currentTrack && (
+                    <AlbumArt
+                      thumbnailUrl={currentTrack.thumbnailUrl}
+                      videoId={currentTrack.videoId}
+                      title={currentTrack.title}
+                      artist={currentTrack.artist}
                       className="hero-art"
                     />
                   )}
@@ -1068,11 +1608,12 @@ export default function App() {
                               className={`music-card ${isCurrent ? "playing" : ""}`}
                             >
                               <div className="card-cover-wrap">
-                                <img
-                                  src={track.thumbnailUrl}
-                                  alt={track.title}
+                                <AlbumArt
+                                  thumbnailUrl={track.thumbnailUrl}
+                                  videoId={track.videoId}
+                                  title={track.title}
+                                  artist={track.artist}
                                   className="card-cover"
-                                  loading="lazy"
                                 />
                                 <div className="card-overlay-actions">
                                   <button
@@ -1183,13 +1724,48 @@ export default function App() {
               </div>
             )}
 
+            {/* SPOTIFY-STYLE AI DJ MIX VIEW */}
+            {navTab === "dj" && (
+              <DjMixConsole
+                currentTrack={currentTrack}
+                nextTrack={nextTrack}
+                isPlaying={isPlaying}
+                analyser={analyser}
+                djEnabled={djEnabled}
+                djVibe={djVibe}
+                djLoading={djLoading}
+                djComment={djComment}
+                djVoiceEnabled={djVoiceEnabled}
+                crossfadeSec={crossfadeSec}
+                crossfadeActive={crossfadeActive}
+                eq={eq}
+                onToggleDj={handleToggleDj}
+                onSelectVibe={(v) => void startDjVibe(v)}
+                onToggleDjVoice={() => setDjVoiceEnabled((v) => !v)}
+                onChangeCrossfadeSec={setCrossfadeSec}
+                onChangeEq={setEq}
+                onSpeakNow={() => {
+                  if (currentTrack) {
+                    const vibeLabel = DJ_VIBES.find((v) => v.id === djVibe)?.label;
+                    speakDjTransition(currentTrack, vibeLabel);
+                  }
+                }}
+                onImportLocalLossless={handleImportLocalLossless}
+              />
+            )}
+
             {/* IMMERSIVE LYRICS VIEW */}
             {navTab === "lyrics" && (
               <div className="lyrics-stage">
                 <div className="lyrics-left-col">
                   <div className={`lyrics-cover-frame ${isPlaying ? "playing" : ""}`}>
-                    {currentTrack?.thumbnailUrl ? (
-                      <img src={currentTrack.thumbnailUrl} alt={currentTrack.title} />
+                    {currentTrack ? (
+                      <AlbumArt
+                        thumbnailUrl={currentTrack.thumbnailUrl}
+                        videoId={currentTrack.videoId}
+                        title={currentTrack.title}
+                        artist={currentTrack.artist}
+                      />
                     ) : (
                       <div
                         style={{
@@ -1217,7 +1793,7 @@ export default function App() {
                     </p>
                   </div>
 
-                  <SpectrumCanvas analyser={analyser} isPlaying={isPlaying} />
+                  <SpectrumCanvas analyser={analyser} isPlaying={isPlaying} variant="stage" />
 
                   <div className="lyrics-tools">
                     {(
@@ -1233,7 +1809,7 @@ export default function App() {
                         type="button"
                         className={`chip-btn ${lyricsSourcePref === srcKey ? "active" : ""}`}
                         onClick={() => void handleSwitchLyricsSource(srcKey)}
-                        disabled={!currentTrack || lyricsLoading}
+                        disabled={!currentTrack || lyricsLoading || Boolean(currentTrack?.localFileUrl)}
                       >
                         {label}
                       </button>
@@ -1366,7 +1942,7 @@ export default function App() {
                     tracks={queue}
                     currentVideoId={currentTrack?.videoId}
                     favoriteIds={favoriteIds}
-                    onPlayTrack={(_, idx) => void playQueueIndex(idx)}
+                    onPlayTrack={(_, idx) => void playQueueIndex(idx, false)}
                     onPlayNext={addTrackNext}
                     onAddToQueue={addTrackToQueue}
                     onToggleFavorite={toggleFavorite}
@@ -1377,7 +1953,7 @@ export default function App() {
               </div>
             )}
 
-            {/* LIBRARY (FAVORITES & HISTORY) VIEW */}
+            {/* LIBRARY VIEW */}
             {navTab === "library" && (
               <div style={{ display: "flex", flexDirection: "column", gap: 28 }}>
                 <section>
@@ -1454,12 +2030,148 @@ export default function App() {
               </div>
             )}
 
-            {/* SETTINGS & GPL-3.0 LICENSE VIEW */}
+            {/* SETTINGS, LOSS-LESS AUDIO, AUTO-UPDATER & CROSS-PLATFORM VIEW */}
             {navTab === "settings" && (
               <div className="settings-grid">
                 <div className="panel-card">
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <h3 style={{ margin: 0, fontSize: 16 }}>串流與 YTMAPI 引擎狀態</h3>
+                    <h3 style={{ margin: 0, fontSize: 16 }}>音質・毛玻璃特效設定</h3>
+                    <span className="quality-badge">
+                      {engineStatus ? `${engineStatus.platform} / ${engineStatus.arch}` : "Cross-Platform"}
+                    </span>
+                  </div>
+
+                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>串流音質與 DSP 引擎：</div>
+                  <div className="chip-row">
+                    {(
+                      [
+                        ["lossless", "Hi-Res 無損母帶 (48kHz + 32-bit DSP)"],
+                        ["high", "極高音質 (AAC/M4A)"],
+                        ["standard", "標準省流"],
+                      ] as const
+                    ).map(([q, lbl]) => (
+                      <button
+                        key={q}
+                        type="button"
+                        className={`chip-btn ${audioQuality === q ? "active" : ""}`}
+                        onClick={() => setAudioQuality(q)}
+                      >
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 4 }}>
+                    低耗能毛玻璃模式：
+                  </div>
+                  <div className="chip-row">
+                    <button
+                      type="button"
+                      className={`chip-btn ${glassMode === "acrylic" ? "active" : ""}`}
+                      onClick={() => setGlassMode("acrylic")}
+                    >
+                      絢麗毛玻璃 (Acrylic + 封面動態取色)
+                    </button>
+                    <button
+                      type="button"
+                      className={`chip-btn ${glassMode === "lite" ? "active" : ""}`}
+                      onClick={() => setGlassMode("lite")}
+                    >
+                      極致省電 (Lite)
+                    </button>
+                  </div>
+
+                  {streamInfo && (
+                    <>
+                      <div className="info-kv">
+                        <span className="info-k">目前音訊規格</span>
+                        <span className="info-v">
+                          {streamInfo.qualityLabel} ({streamInfo.acodec} · {streamInfo.abr})
+                        </span>
+                      </div>
+                      <div className="info-kv">
+                        <span className="info-k">位元深度 / 引擎</span>
+                        <span className="info-v">
+                          {streamInfo.bitDepth} · {streamInfo.engineUsed}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* Auto-Updater Panel */}
+                <div className="panel-card">
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <ArrowUpCircle size={18} style={{ color: "var(--accent-secondary)" }} />
+                      <h3 style={{ margin: 0, fontSize: 16 }}>自動檢查與核心更新</h3>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      style={{ padding: "6px 11px", fontSize: 12 }}
+                      onClick={() => void handleCheckUpdates(false)}
+                      disabled={checkingUpdate}
+                    >
+                      <RefreshCw size={13} className={checkingUpdate ? "spin" : ""} />
+                      檢查更新
+                    </button>
+                  </div>
+
+                  <div className="info-kv">
+                    <span className="info-k">AetherMusic 目前版本</span>
+                    <span className="info-v tabular-nums">
+                      v{updateStatus?.currentAppVersion || "0.2.0"}
+                    </span>
+                  </div>
+                  <div className="info-kv">
+                    <span className="info-k">串流核心 (yt-dlp / InnerTube)</span>
+                    <span className="info-v tabular-nums">
+                      {updateStatus?.ytdlpCurrentVersion || engineStatus?.ytdlpVersion || "Rust InnerTube"}
+                      {updateStatus?.ytdlpLatestVersion &&
+                      updateStatus.ytdlpUpdateAvailable
+                        ? ` → 最新 ${updateStatus.ytdlpLatestVersion}`
+                        : ""}
+                    </span>
+                  </div>
+                  {updateStatus?.releaseNotes && (
+                    <div className="code-pill" title={updateStatus.releaseNotes}>
+                      {updateStatus.releaseNotes}
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    <button
+                      type="button"
+                      className="primary-btn"
+                      style={{ padding: "8px 14px", fontSize: 12.5 }}
+                      onClick={() => void handleRunCoreUpdate()}
+                      disabled={updatingCore}
+                    >
+                      {updatingCore ? <Loader2 size={14} className="spin" /> : <ArrowUpCircle size={14} />}
+                      {updatingCore ? "更新串流核心中..." : "一鍵更新串流核心"}
+                    </button>
+                    {updateStatus?.releaseUrl && (
+                      <a
+                        href={updateStatus.releaseUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="secondary-btn"
+                        style={{ padding: "8px 14px", fontSize: 12.5, textDecoration: "none" }}
+                      >
+                        前往 GitHub Releases
+                      </a>
+                    )}
+                  </div>
+                </div>
+
+                {/* Engine Status & GPL-3.0 */}
+                <div className="panel-card">
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <ShieldCheck size={18} style={{ color: "var(--accent-secondary)" }} />
+                      <h3 style={{ margin: 0, fontSize: 16 }}>跨平臺引擎與 GPL-3.0 授權</h3>
+                    </div>
                     <button
                       type="button"
                       className="secondary-btn"
@@ -1467,27 +2179,19 @@ export default function App() {
                       onClick={() => void refreshEngineStatus()}
                     >
                       <RefreshCw size={13} />
-                      重新檢查
+                      重新偵測
                     </button>
                   </div>
                   <div className="info-kv">
-                    <span className="info-k">YTMAPI (InnerTube WEB_REMIX)</span>
-                    <span className="info-v" style={{ color: "#10b981", fontWeight: 600 }}>
-                      正常連線中
-                    </span>
+                    <span className="info-k">跨平臺架構</span>
+                    <span className="info-v">Windows / Linux / Android (Tauri v2)</span>
                   </div>
                   <div className="info-kv">
-                    <span className="info-k">yt-dlp 狀態</span>
-                    <span
-                      className="info-v"
-                      style={{
-                        color: engineStatus?.ytdlpAvailable ? "#10b981" : "#f59e0b",
-                        fontWeight: 600,
-                      }}
-                    >
-                      {engineStatus?.ytdlpAvailable
-                        ? `可用 (v${engineStatus.ytdlpVersion})`
-                        : "待初始化 / 將自動下載"}
+                    <span className="info-k">本地 Range 代理伺服器</span>
+                    <span className="info-v tabular-nums">
+                      {engineStatus?.proxyPort
+                        ? `http://127.0.0.1:${engineStatus.proxyPort}`
+                        : "未啟動"}
                     </span>
                   </div>
                   {engineStatus?.ytdlpPath && (
@@ -1495,42 +2199,11 @@ export default function App() {
                       {engineStatus.ytdlpPath}
                     </div>
                   )}
-                  <div className="info-kv">
-                    <span className="info-k">本地 HTTP Range 代理伺服器</span>
-                    <span className="info-v tabular-nums">
-                      {engineStatus?.proxyPort
-                        ? `http://127.0.0.1:${engineStatus.proxyPort}`
-                        : "未啟動"}
-                    </span>
-                  </div>
-                  {streamInfo && (
-                    <div className="info-kv">
-                      <span className="info-k">目前串流編碼</span>
-                      <span className="info-v">
-                        {streamInfo.acodec} · {streamInfo.abr}
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="panel-card">
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <ShieldCheck size={18} style={{ color: "var(--accent-secondary)" }} />
-                    <h3 style={{ margin: 0, fontSize: 16 }}>授權條款與專案資訊 (GPL-3.0)</h3>
-                  </div>
-                  <p style={{ margin: 0, fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.6 }}>
-                    <strong>AetherMusic</strong> 採用 <strong>GNU General Public License v3.0 (GPL-3.0)</strong> 開源授權發佈。您可以自由使用、研究、修改並依據相同條款散佈本軟體。
+                  <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-secondary)", lineHeight: 1.6 }}>
+                    採用 <strong>GNU General Public License v3.0 (GPL-3.0)</strong> 開源授權發佈。
                   </p>
                   <div className="code-pill">
-                    GitHub: https://github.com/hankyleisplay/AetherMusic.git
-                  </div>
-                  <div className="info-kv">
-                    <span className="info-k">桌面框架</span>
-                    <span className="info-v">Tauri v2 + Rust + React 19</span>
-                  </div>
-                  <div className="info-kv">
-                    <span className="info-k">歌詞瀑布流引擎</span>
-                    <span className="info-v">LRCLIB → YTMAPI → yt-dlp CC</span>
+                    https://github.com/hankyleisplay/AetherMusic.git
                   </div>
                 </div>
               </div>
@@ -1588,7 +2261,7 @@ export default function App() {
                     </button>
                   </div>
 
-                  {currentTrack && (
+                  {currentTrack && !currentTrack.localFileUrl && (
                     <button
                       type="button"
                       className="secondary-btn"
@@ -1613,13 +2286,19 @@ export default function App() {
                         <div
                           key={`${track.videoId}-${idx}`}
                           className={`queue-item ${isCur ? "current" : ""}`}
-                          onDoubleClick={() => void playQueueIndex(idx)}
+                          onDoubleClick={() => void playQueueIndex(idx, false)}
                         >
-                          <img src={track.thumbnailUrl} alt={track.title} className="queue-thumb" />
+                          <AlbumArt
+                            thumbnailUrl={track.thumbnailUrl}
+                            videoId={track.videoId}
+                            title={track.title}
+                            artist={track.artist}
+                            className="queue-thumb"
+                          />
                           <div
                             className="queue-info"
                             style={{ cursor: "pointer" }}
-                            onClick={() => void playQueueIndex(idx)}
+                            onClick={() => void playQueueIndex(idx, false)}
                           >
                             <div className="truncate" style={{ fontSize: 12.5, fontWeight: 600 }}>
                               {track.title}
@@ -1678,8 +2357,8 @@ export default function App() {
                               borderRadius: 8,
                               fontSize: active ? 14.5 : 13,
                               fontWeight: active ? 700 : 500,
-                              color: active ? "#fff" : "rgba(255,255,255,0.45)",
-                              background: active ? "rgba(124,92,255,0.22)" : "transparent",
+                              color: active ? "#fff" : "rgba(255,255,255,0.48)",
+                              background: active ? "rgba(var(--accent-rgb-1), 0.3)" : "transparent",
                               lineHeight: 1.5,
                               transition: "all 0.16s ease",
                             }}
@@ -1712,9 +2391,11 @@ export default function App() {
                   ) : (
                     <>
                       <div className="info-card">
-                        <img
-                          src={songDetail?.thumbnailUrl || currentTrack.thumbnailUrl}
-                          alt={currentTrack.title}
+                        <AlbumArt
+                          thumbnailUrl={songDetail?.thumbnailUrl || currentTrack.thumbnailUrl}
+                          videoId={currentTrack.videoId}
+                          title={songDetail?.title || currentTrack.title}
+                          artist={songDetail?.artist || currentTrack.artist}
                           style={{
                             width: "100%",
                             aspectRatio: "1 / 1",
@@ -1737,14 +2418,16 @@ export default function App() {
                           <span className="info-v">{songDetail?.viewCountText || "—"}</span>
                         </div>
                         <div className="info-kv">
-                          <span className="info-k">yt-dlp 音訊</span>
+                          <span className="info-k">音訊規格</span>
                           <span className="info-v">
-                            {streamInfo ? `${streamInfo.acodec} · ${streamInfo.abr}` : "解析中"}
+                            {streamInfo
+                              ? `${streamInfo.acodec} · ${streamInfo.abr} · ${streamInfo.sampleRate}`
+                              : "解析中"}
                           </span>
                         </div>
                         <div className="info-kv">
-                          <span className="info-k">Video ID</span>
-                          <span className="info-v tabular-nums">{currentTrack.videoId}</span>
+                          <span className="info-k">串流引擎</span>
+                          <span className="info-v">{streamInfo?.engineUsed || "—"}</span>
                         </div>
                       </div>
 
@@ -1760,7 +2443,13 @@ export default function App() {
                               onClick={() => playTrackFromList(rel)}
                               style={{ cursor: "pointer" }}
                             >
-                              <img src={rel.thumbnailUrl} alt={rel.title} className="queue-thumb" />
+                              <AlbumArt
+                                thumbnailUrl={rel.thumbnailUrl}
+                                videoId={rel.videoId}
+                                title={rel.title}
+                                artist={rel.artist}
+                                className="queue-thumb"
+                              />
                               <div className="queue-info">
                                 <div className="truncate" style={{ fontSize: 12.5, fontWeight: 600 }}>
                                   {rel.title}
@@ -1793,14 +2482,16 @@ export default function App() {
         )}
       </div>
 
-      {/* Bottom Fixed Transport Bar */}
+      {/* Bottom Fixed Transport Bar with Mini Live Spectrum */}
       <footer className="player-bar">
         <div className="player-left">
           {currentTrack ? (
             <>
-              <img
-                src={currentTrack.thumbnailUrl}
-                alt={currentTrack.title}
+              <AlbumArt
+                thumbnailUrl={currentTrack.thumbnailUrl}
+                videoId={currentTrack.videoId}
+                title={currentTrack.title}
+                artist={currentTrack.artist}
                 className="player-cover"
                 onClick={() => setNavTab("lyrics")}
                 style={{ cursor: "pointer" }}
@@ -1818,8 +2509,10 @@ export default function App() {
                   <span className="player-artist truncate" title={currentTrack.artist}>
                     {currentTrack.artist}
                   </span>
-                  {streamInfo?.abr && (
-                    <span className="quality-badge">{streamInfo.abr}</span>
+                  {streamInfo && (
+                    <span className="quality-badge">
+                      {audioQuality === "lossless" ? "Hi-Res" : streamInfo.abr}
+                    </span>
                   )}
                 </div>
               </div>
@@ -1838,7 +2531,7 @@ export default function App() {
           ) : (
             <div className="player-track-meta">
               <div className="player-title truncate">AetherMusic 已就緒</div>
-              <div className="player-artist truncate">選擇一首歌曲開始雲端串流</div>
+              <div className="player-artist truncate">Hi-Res 無損串流 · AI DJ Mix</div>
             </div>
           )}
         </div>
@@ -1880,7 +2573,7 @@ export default function App() {
               type="button"
               className="ctrl-btn"
               title="下一首"
-              onClick={() => void handleNext()}
+              onClick={() => void handleNext(djEnabled || crossfadeSec > 0)}
               disabled={!currentTrack}
             >
               <SkipForward size={18} fill="currentColor" />
@@ -1913,6 +2606,15 @@ export default function App() {
         </div>
 
         <div className="player-right">
+          <SpectrumCanvas analyser={analyser} isPlaying={isPlaying} variant="mini" />
+          <button
+            type="button"
+            className={`ctrl-btn ${navTab === "dj" ? "active" : ""}`}
+            title="AI DJ Mix 混音台"
+            onClick={() => setNavTab(navTab === "dj" ? "home" : "dj")}
+          >
+            <Radio size={16} />
+          </button>
           <button
             type="button"
             className={`ctrl-btn ${navTab === "lyrics" ? "active" : ""}`}
@@ -1964,6 +2666,58 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      {/* Mobile / Android Bottom Navigation Bar */}
+      <nav className="mobile-bottom-nav" aria-label="行動導覽列">
+        <button
+          type="button"
+          className={`mobile-nav-btn ${navTab === "home" ? "active" : ""}`}
+          onClick={() => setNavTab("home")}
+        >
+          <Home size={18} />
+          <span>首頁</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-nav-btn ${navTab === "search" ? "active" : ""}`}
+          onClick={() => setNavTab("search")}
+        >
+          <Search size={18} />
+          <span>搜尋</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-nav-btn ${navTab === "dj" ? "active" : ""}`}
+          onClick={() => setNavTab("dj")}
+        >
+          <Radio size={18} />
+          <span>DJ Mix</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-nav-btn ${navTab === "lyrics" ? "active" : ""}`}
+          onClick={() => setNavTab("lyrics")}
+        >
+          <Mic2 size={18} />
+          <span>歌詞</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-nav-btn ${navTab === "queue" ? "active" : ""}`}
+          onClick={() => setNavTab("queue")}
+        >
+          <ListMusic size={18} />
+          <span>佇列</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-nav-btn ${navTab === "settings" ? "active" : ""}`}
+          onClick={() => setNavTab("settings")}
+        >
+          <Settings size={18} />
+          <span>設定</span>
+        </button>
+      </nav>
     </div>
   );
 }
