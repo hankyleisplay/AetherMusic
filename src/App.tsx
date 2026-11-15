@@ -1243,7 +1243,21 @@ export default function App() {
           if (activeDeckRef.current === "A") setIsBuffering(false);
         }}
         onEnded={() => void handleTrackEnded("A")}
-        onError={() => {
+        onError={(e) => {
+          const el = e.currentTarget;
+          if (
+            activeDeckRef.current === "A" &&
+            streamInfo?.directUrl &&
+            el.src !== streamInfo.directUrl &&
+            !el.src.startsWith("blob:")
+          ) {
+            el.src = streamInfo.directUrl;
+            void el.play().catch(() => {
+              setIsBuffering(false);
+              setIsPlaying(false);
+            });
+            return;
+          }
           if (activeDeckRef.current === "A") {
             setIsBuffering(false);
             setIsPlaying(false);
@@ -1277,7 +1291,21 @@ export default function App() {
           if (activeDeckRef.current === "B") setIsBuffering(false);
         }}
         onEnded={() => void handleTrackEnded("B")}
-        onError={() => {
+        onError={(e) => {
+          const el = e.currentTarget;
+          if (
+            activeDeckRef.current === "B" &&
+            streamInfo?.directUrl &&
+            el.src !== streamInfo.directUrl &&
+            !el.src.startsWith("blob:")
+          ) {
+            el.src = streamInfo.directUrl;
+            void el.play().catch(() => {
+              setIsBuffering(false);
+              setIsPlaying(false);
+            });
+            return;
+          }
           if (activeDeckRef.current === "B") {
             setIsBuffering(false);
             setIsPlaying(false);
