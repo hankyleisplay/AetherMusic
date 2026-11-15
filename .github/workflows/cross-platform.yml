@@ -160,9 +160,33 @@ jobs:
       - name: Build Android APK (aarch64)
         run: npx tauri android build --apk --target aarch64 --ci
 
+      - name: Sign Android APK
+        shell: bash
+        run: |
+          UNSIGNED_APK="$(find src-tauri/gen/android/app/build/outputs/apk -name '*-unsigned.apk' -type f | head -n 1)"
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "No unsigned APK found"
+            exit 1
+          fi
+          OUT_DIR="$(dirname "$UNSIGNED_APK")"
+          KEYSTORE="$RUNNER_TEMP/aethermusic-release.keystore"
+          keytool -genkeypair -v -keystore "$KEYSTORE" -alias aethermusic \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass aethermusic -keypass aethermusic \
+            -dname "CN=AetherMusic,O=hankyleisplay,C=TW"
+          "$ANDROID_HOME/build-tools/34.0.0/zipalign" -v -p 4 "$UNSIGNED_APK" "$RUNNER_TEMP/aligned.apk"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias aethermusic \
+            --ks-pass pass:aethermusic \
+            --key-pass pass:aethermusic \
+            --out "$OUT_DIR/AetherMusic-arm64-signed.apk" \
+            "$RUNNER_TEMP/aligned.apk"
+          rm -f "$UNSIGNED_APK"
+
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
           name: aethermusic-android-arm64
-          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*-signed.apk
           if-no-files-found: warn

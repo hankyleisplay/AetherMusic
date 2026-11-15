@@ -109,13 +109,59 @@ async fn run_core_update(state: State<'_, AppState>) -> Result<UpdateActionResul
     updater::perform_core_update(&state).await
 }
 
+#[cfg(target_os = "windows")]
+fn configure_windows_webview_data_dir() {
+    if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_some() {
+        return;
+    }
+
+    let Some(local_base) = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("TEMP"))
+        .map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+
+    let base_dir = local_base.join("com.hankyleisplay.aethermusic");
+    let preferred_name = if cfg!(debug_assertions) {
+        "webview-dev"
+    } else {
+        "webview-release"
+    };
+    let default_folder = base_dir.join(preferred_name);
+
+    let lock_candidates = [
+        default_folder.join("EBWebView").join("Default").join("LOCK"),
+        default_folder.join("EBWebView").join("lockfile"),
+    ];
+    let is_locked = lock_candidates.iter().any(|lock_path| {
+        lock_path.exists()
+            && std::fs::OpenOptions::new()
+                .write(true)
+                .open(lock_path)
+                .is_err()
+    });
+
+    let chosen_dir = if is_locked {
+        base_dir.join(format!("webview-instance-{}", std::process::id()))
+    } else {
+        default_folder
+    };
+
+    let _ = std::fs::create_dir_all(&chosen_dir);
+    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", chosen_dir);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "windows")]
-    if let Ok(path_val) = std::env::var("PATH") {
-        if path_val.contains('"') {
-            std::env::set_var("PATH", path_val.replace('"', ""));
+    {
+        if let Ok(path_val) = std::env::var("PATH") {
+            if path_val.contains('"') {
+                std::env::set_var("PATH", path_val.replace('"', ""));
+            }
         }
+        configure_windows_webview_data_dir();
     }
 
     let app_state = AppState::new();
@@ -124,23 +170,22 @@ pub fn run() {
         .manage(app_state)
         .setup(|app| {
             let state = app.state::<AppState>().inner().clone();
-            if let Ok(data_dir) = app.path().app_data_dir() {
-                let state_dir = state.clone();
-                tauri::async_runtime::block_on(async move {
-                    *state_dir.app_data_dir.write().await = Some(data_dir);
-                });
-            }
+            let maybe_data_dir = app.path().app_data_dir().ok();
 
-            let state_proxy = state.clone();
-            tauri::async_runtime::block_on(async move {
-                if let Err(e) = proxy::start_proxy_server(state_proxy).await {
+            tauri::async_runtime::spawn(async move {
+                if let Some(data_dir) = maybe_data_dir {
+                    *state.app_data_dir.write().await = Some(data_dir);
+                }
+
+                let state_proxy = state.clone();
+                let state_detect = state;
+                let (proxy_res, _) = tokio::join!(
+                    proxy::start_proxy_server(state_proxy),
+                    ytdlp::detect_or_setup_ytdlp(&state_detect, false)
+                );
+                if let Err(e) = proxy_res {
                     eprintln!("Warning: could not start local audio proxy: {e}");
                 }
-            });
-
-            let state_detect = state;
-            tauri::async_runtime::spawn(async move {
-                let _ = ytdlp::detect_or_setup_ytdlp(&state_detect, false).await;
             });
 
             Ok(())
