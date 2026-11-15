@@ -28,6 +28,11 @@ fn build_ytdlp_command(runner: &YtDlpRunner, args: &[&str]) -> Command {
             c
         }
     };
+    if let Ok(path_val) = std::env::var("PATH") {
+        if path_val.contains('"') {
+            cmd.env("PATH", path_val.replace('"', ""));
+        }
+    }
     apply_no_window(&mut cmd);
     cmd
 }

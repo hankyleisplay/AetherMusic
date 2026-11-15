@@ -90,6 +90,13 @@ async fn get_engine_status(state: State<'_, AppState>) -> Result<EngineStatus, S
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    if let Ok(path_val) = std::env::var("PATH") {
+        if path_val.contains('"') {
+            std::env::set_var("PATH", path_val.replace('"', ""));
+        }
+    }
+
     let app_state = AppState::new();
 
     tauri::Builder::default()
