@@ -552,7 +552,7 @@ async fn extract_stream_ytdlp(
     })
 }
 
-pub async fn get_or_extract_stream(
+pub async fn extract_stream_network(
     state: &AppState,
     video_id: &str,
     quality: &str,
@@ -566,7 +566,9 @@ pub async fn get_or_extract_stream(
     {
         let cache = state.stream_cache.read().await;
         if let Some(entry) = cache.get(&cache_key) {
-            if entry.fetched_at.elapsed() < Duration::from_secs(STREAM_TTL_SECS) {
+            if entry.fetched_at.elapsed() < Duration::from_secs(STREAM_TTL_SECS)
+                && !entry.direct_url.starts_with("file://")
+            {
                 return Ok(entry.clone());
             }
         }
@@ -578,7 +580,9 @@ pub async fn get_or_extract_stream(
     {
         let cache = state.stream_cache.read().await;
         if let Some(entry) = cache.get(&cache_key) {
-            if entry.fetched_at.elapsed() < Duration::from_secs(STREAM_TTL_SECS) {
+            if entry.fetched_at.elapsed() < Duration::from_secs(STREAM_TTL_SECS)
+                && !entry.direct_url.starts_with("file://")
+            {
                 return Ok(entry.clone());
             }
         }
@@ -596,6 +600,18 @@ pub async fn get_or_extract_stream(
         .insert(cache_key, extracted.clone());
 
     Ok(extracted)
+}
+
+pub async fn get_or_extract_stream(
+    state: &AppState,
+    video_id: &str,
+    quality: &str,
+) -> Result<CachedStream, String> {
+    if let Some((path, entry)) = crate::cache::get_cached_audio(state, video_id).await {
+        return Ok(crate::cache::cached_entry_to_stream(&entry, &path));
+    }
+
+    extract_stream_network(state, video_id, quality).await
 }
 
 pub async fn build_stream_info(

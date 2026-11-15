@@ -1,4 +1,4 @@
-import { Heart, ListEnd, ListPlus, Play, Sparkles, Trash2 } from "lucide-react";
+import { Download, Heart, ListEnd, ListPlus, Loader2, Play, Sparkles, Trash2 } from "lucide-react";
 import type { Track } from "../types";
 import { AlbumArt } from "./AlbumArt";
 
@@ -6,10 +6,12 @@ interface TrackTableProps {
   tracks: Track[];
   currentVideoId?: string;
   favoriteIds: Set<string>;
+  downloadingIds?: Set<string>;
   onPlayTrack: (track: Track, index: number) => void;
   onPlayNext: (track: Track) => void;
   onAddToQueue: (track: Track) => void;
   onToggleFavorite: (track: Track) => void;
+  onDownloadTrack?: (track: Track) => void;
   onRemoveAt?: (index: number) => void;
   showAutoBadge?: boolean;
 }
@@ -18,10 +20,12 @@ export function TrackTable({
   tracks,
   currentVideoId,
   favoriteIds,
+  downloadingIds,
   onPlayTrack,
   onPlayNext,
   onAddToQueue,
   onToggleFavorite,
+  onDownloadTrack,
   onRemoveAt,
   showAutoBadge = false,
 }: TrackTableProps) {
@@ -119,6 +123,21 @@ export function TrackTable({
               >
                 <Heart size={14} fill={isFav ? "currentColor" : "none"} />
               </button>
+              {onDownloadTrack && !track.localFileUrl && !track.videoId.startsWith("local-") && (
+                <button
+                  type="button"
+                  className="action-icon-btn"
+                  title="下載至本機（含封面與中繼資料）"
+                  disabled={downloadingIds?.has(track.videoId)}
+                  onClick={() => onDownloadTrack(track)}
+                >
+                  {downloadingIds?.has(track.videoId) ? (
+                    <Loader2 size={14} className="spin" />
+                  ) : (
+                    <Download size={14} />
+                  )}
+                </button>
+              )}
               {onRemoveAt && (
                 <button
                   type="button"

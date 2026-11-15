@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   ArrowUpCircle,
   Compass,
   Disc3,
+  Download,
+  HardDrive,
   Heart,
   Home,
   Info,
@@ -33,15 +36,26 @@ import {
 } from "lucide-react";
 import {
   checkForUpdates,
+  clearAudioCache,
+  clearPlayHistoryDb,
+  downloadTrack,
+  getCacheStats,
   getEngineStatus,
   getHomeDiscovery,
   getLyrics,
   getRecommendations,
   getSongDetail,
   getStreamUrl,
+  loadUserStore,
   prefetchStream,
+  recordPlayHistoryDb,
   runCoreUpdate,
+  savePlaybackSnapshot,
   searchMusic,
+  setCloseToTray as setCloseToTrayCmd,
+  toggleFavoriteDb,
+  triggerAudioCache,
+  updateMediaSession,
 } from "./api";
 import { AlbumArt } from "./components/AlbumArt";
 import { DJ_VIBES, DjMixConsole, type DjVibeOption } from "./components/DjMixConsole";
@@ -50,14 +64,15 @@ import { StartupSplash } from "./components/StartupSplash";
 import { TrackTable } from "./components/TrackTable";
 import type {
   AudioQuality,
+  CacheStats,
   DjVibeId,
   EngineStatus,
   EqSettings,
   GlassMode,
   HomeSection,
   LyricsResponse,
-  LyricsSourcePreference,
   NavTab,
+  PersistedSettings,
   RepeatMode,
   SearchFilter,
   SidePanelTab,
@@ -94,6 +109,15 @@ function formatTime(seconds: number): string {
     return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   }
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1024) {
+    return `${(mb / 1024).toFixed(2)} GB`;
+  }
+  return `${mb.toFixed(1)} MB`;
 }
 
 function loadJsonStorage<T>(key: string, fallback: T): T {
@@ -134,6 +158,7 @@ export default function App() {
         djVoiceEnabled: true,
         djVibe: "club" as DjVibeId,
         eq: { low: 1.5, mid: 0.5, high: 2.5, preset: "hires" } as EqSettings,
+        closeToTray: true,
       }),
     []
   );
@@ -170,16 +195,18 @@ export default function App() {
   const [songDetail, setSongDetail] = useState<SongMetadata | null>(null);
   const [lyrics, setLyrics] = useState<LyricsResponse | null>(null);
   const [lyricsLoading, setLyricsLoading] = useState(false);
-  const [lyricsSourcePref, setLyricsSourcePref] = useState<LyricsSourcePreference>("auto");
   const [lyricsOffset, setLyricsOffset] = useState<number>(0);
 
-  // Library, Engine & Auto-Updater
+  // Library, Cache, Tray, Engine & Auto-Updater
   const [favorites, setFavorites] = useState<Track[]>(() =>
     loadJsonStorage<Track[]>(STORAGE_FAVS, [])
   );
   const [history, setHistory] = useState<Track[]>(() =>
     loadJsonStorage<Track[]>(STORAGE_HISTORY, [])
   );
+  const [closeToTray, setCloseToTray] = useState<boolean>(initialSettings.closeToTray ?? true);
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+  const [downloadingIds, setDownloadingIds] = useState<Set<string>>(() => new Set());
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -213,6 +240,10 @@ export default function App() {
 
   const playRequestIdRef = useRef<number>(0);
   const crossfadeTriggeredReqRef = useRef<number>(-1);
+  const cacheTriggeredReqRef = useRef<number>(-1);
+  const restoredSeekSecRef = useRef<number>(0);
+  const storeLoadedRef = useRef<boolean>(false);
+  const lastSmtcSyncAtRef = useRef<number>(0);
   const crossfadeCleanupTimerRef = useRef<number | null>(null);
   const playedIdsRef = useRef<Set<string>>(new Set());
   const recInFlightRef = useRef<boolean>(false);
@@ -291,6 +322,7 @@ export default function App() {
           djVoiceEnabled,
           djVibe,
           eq,
+          closeToTray,
         })
       );
     } catch {
@@ -307,7 +339,72 @@ export default function App() {
     djVoiceEnabled,
     djVibe,
     eq,
+    closeToTray,
   ]);
+
+  const buildCurrentSettings = useCallback(
+    (): PersistedSettings => ({
+      volume,
+      autoRadio,
+      repeatMode,
+      shuffle,
+      audioQuality,
+      glassMode,
+      crossfadeSec,
+      djVoiceEnabled,
+      djVibe,
+      eq,
+      closeToTray,
+    }),
+    [
+      audioQuality,
+      autoRadio,
+      closeToTray,
+      crossfadeSec,
+      djVibe,
+      djVoiceEnabled,
+      eq,
+      glassMode,
+      repeatMode,
+      shuffle,
+      volume,
+    ]
+  );
+
+  const persistSnapshot = useCallback(
+    (overridePosSec?: number) => {
+      if (!storeLoadedRef.current) return;
+      const activeAudio = activeDeckRef.current === "A" ? audioARef.current : audioBRef.current;
+      const posSec =
+        overridePosSec ??
+        (activeAudio && Number.isFinite(activeAudio.currentTime)
+          ? activeAudio.currentTime
+          : restoredSeekSecRef.current || 0);
+      savePlaybackSnapshot({
+        queue: queueRef.current,
+        currentIndex: currentIndexRef.current,
+        positionSec: posSec,
+        settings: buildCurrentSettings(),
+      }).catch(() => {});
+    },
+    [buildCurrentSettings]
+  );
+
+  useEffect(() => {
+    if (!storeLoadedRef.current) return;
+    const t = window.setTimeout(() => {
+      persistSnapshot();
+    }, 450);
+    return () => window.clearTimeout(t);
+  }, [queue, currentIndex, buildCurrentSettings, persistSnapshot]);
+
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      persistSnapshot();
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [persistSnapshot]);
 
   useEffect(() => {
     const v = muted ? 0 : volume;
@@ -439,6 +536,12 @@ export default function App() {
     } catch {
       // ignore outside Tauri
     }
+    try {
+      const cs = await getCacheStats();
+      setCacheStats(cs);
+    } catch {
+      // ignore
+    }
   }, []);
 
   const handleCheckUpdates = useCallback(
@@ -495,6 +598,66 @@ export default function App() {
     void refreshEngineStatus();
     void loadHome();
     void handleCheckUpdates(true);
+
+    loadUserStore()
+      .then((store) => {
+        if (store.favorites.length > 0) {
+          setFavorites(store.favorites);
+        }
+        if (store.history.length > 0) {
+          setHistory(store.history);
+        }
+        if (store.settings) {
+          setVolume(store.settings.volume ?? 0.85);
+          setAutoRadio(store.settings.autoRadio ?? true);
+          setRepeatMode((store.settings.repeatMode as RepeatMode) || "off");
+          setShuffle(Boolean(store.settings.shuffle));
+          setAudioQuality((store.settings.audioQuality as AudioQuality) || "lossless");
+          setGlassMode((store.settings.glassMode as GlassMode) || "acrylic");
+          setCrossfadeSec(store.settings.crossfadeSec ?? 5);
+          setDjVoiceEnabled(store.settings.djVoiceEnabled ?? true);
+          setDjVibe((store.settings.djVibe as DjVibeId) || "club");
+          if (store.settings.eq) {
+            setEq(store.settings.eq);
+          }
+          setCloseToTray(store.settings.closeToTray ?? true);
+        }
+        if (queueRef.current.length === 0 && store.lastQueue.length > 0) {
+          const validIdx = Math.max(
+            0,
+            Math.min(store.lastIndex >= 0 ? store.lastIndex : 0, store.lastQueue.length - 1)
+          );
+          const restored = store.lastQueue[validIdx];
+          queueRef.current = store.lastQueue;
+          currentIndexRef.current = validIdx;
+          setQueue(store.lastQueue);
+          setCurrentIndex(validIdx);
+          setDuration(restored.durationSeconds || 0);
+          setCurrentTime(store.lastPositionSec || 0);
+          restoredSeekSecRef.current = store.lastPositionSec || 0;
+          const reqId = ++playRequestIdRef.current;
+          void getSongDetail(restored.videoId)
+            .then((meta) => {
+              if (playRequestIdRef.current === reqId) setSongDetail(meta);
+            })
+            .catch(() => {});
+          void getLyrics(
+            restored.videoId,
+            restored.title,
+            restored.artist,
+            restored.durationSeconds,
+            "auto"
+          )
+            .then((lyr) => {
+              if (playRequestIdRef.current === reqId) setLyrics(lyr);
+            })
+            .catch(() => {});
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        storeLoadedRef.current = true;
+      });
   }, [refreshEngineStatus, loadHome, handleCheckUpdates]);
 
   const appendRecommendations = useCallback(
@@ -546,58 +709,97 @@ export default function App() {
     [showToast]
   );
 
-  const loadMetadataAndLyrics = useCallback(
-    async (track: Track, reqId: number, pref: LyricsSourcePreference) => {
-      if (track.localFileUrl || track.videoId.startsWith("local-")) {
-        setSongDetail(null);
-        setLyrics({
-          videoId: track.videoId,
-          syncedLines: [],
-          plainText: `本機無損音檔播放中\n檔案名稱：${track.title}`,
-          source: "Local Lossless",
-          hasSynced: false,
-        });
-        setLyricsLoading(false);
-        return;
-      }
+  const syncOsMediaSession = useCallback(
+    (track: Track | null, playing: boolean, posSec: number, durSec: number) => {
+      if (!track) return;
+      const resolvedDur = durSec > 0 ? durSec : track.durationSeconds || 0;
+      const safePos = Math.max(0, Number.isFinite(posSec) ? posSec : 0);
 
-      setLyricsLoading(true);
-      setLyricsOffset(0);
-
-      getSongDetail(track.videoId)
-        .then((meta) => {
-          if (playRequestIdRef.current !== reqId) return;
-          setSongDetail(meta);
-        })
-        .catch(() => {});
+      updateMediaSession({
+        title: track.title,
+        artist: track.artist,
+        album: track.album || "AetherMusic",
+        coverUrl: track.thumbnailUrl || null,
+        durationSecs: resolvedDur,
+        positionSecs: safePos,
+        isPlaying: playing,
+      }).catch(() => {});
 
       try {
-        const lyr = await getLyrics(
-          track.videoId,
-          track.title,
-          track.artist,
-          track.durationSeconds,
-          pref
-        );
-        if (playRequestIdRef.current !== reqId) return;
-        setLyrics(lyr);
-      } catch {
-        if (playRequestIdRef.current !== reqId) return;
-        setLyrics({
-          videoId: track.videoId,
-          syncedLines: [],
-          plainText: "",
-          source: "None",
-          hasSynced: false,
-        });
-      } finally {
-        if (playRequestIdRef.current === reqId) {
-          setLyricsLoading(false);
+        if ("mediaSession" in navigator) {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: track.title,
+            artist: track.artist,
+            album: track.album || "AetherMusic",
+            artwork: track.thumbnailUrl
+              ? [{ src: track.thumbnailUrl, sizes: "512x512", type: "image/jpeg" }]
+              : [],
+          });
+          navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+          if (resolvedDur > 0 && "setPositionState" in navigator.mediaSession) {
+            navigator.mediaSession.setPositionState({
+              duration: resolvedDur,
+              playbackRate: 1.0,
+              position: Math.min(safePos, resolvedDur),
+            });
+          }
         }
+      } catch {
+        // ignore unsupported browser mediaSession fields
       }
     },
     []
   );
+
+  const loadMetadataAndLyrics = useCallback(async (track: Track, reqId: number) => {
+    if (track.localFileUrl || track.videoId.startsWith("local-")) {
+      setSongDetail(null);
+      setLyrics({
+        videoId: track.videoId,
+        syncedLines: [],
+        plainText: `本機無損音檔播放中\n檔案名稱：${track.title}`,
+        source: "Local Lossless",
+        hasSynced: false,
+      });
+      setLyricsLoading(false);
+      return;
+    }
+
+    setLyricsLoading(true);
+    setLyricsOffset(0);
+
+    getSongDetail(track.videoId)
+      .then((meta) => {
+        if (playRequestIdRef.current !== reqId) return;
+        setSongDetail(meta);
+      })
+      .catch(() => {});
+
+    try {
+      const lyr = await getLyrics(
+        track.videoId,
+        track.title,
+        track.artist,
+        track.durationSeconds,
+        "auto"
+      );
+      if (playRequestIdRef.current !== reqId) return;
+      setLyrics(lyr);
+    } catch {
+      if (playRequestIdRef.current !== reqId) return;
+      setLyrics({
+        videoId: track.videoId,
+        syncedLines: [],
+        plainText: "",
+        source: "None",
+        hasSynced: false,
+      });
+    } finally {
+      if (playRequestIdRef.current === reqId) {
+        setLyricsLoading(false);
+      }
+    }
+  }, []);
 
   const cancelPendingCrossfade = useCallback(() => {
     if (crossfadeCleanupTimerRef.current !== null) {
@@ -608,7 +810,7 @@ export default function App() {
   }, []);
 
   const playQueueIndex = useCallback(
-    async (idx: number, useCrossfade = false) => {
+    async (idx: number, useCrossfade = false, skipAutoRec = false, resumeSeekSec = 0) => {
       const targetQueue = queueRef.current;
       if (idx < 0 || idx >= targetQueue.length) return;
       const track = targetQueue[idx];
@@ -617,21 +819,31 @@ export default function App() {
 
       const reqId = ++playRequestIdRef.current;
       crossfadeTriggeredReqRef.current = -1;
+      cacheTriggeredReqRef.current = -1;
+      restoredSeekSecRef.current = 0;
       currentIndexRef.current = idx;
       setCurrentIndex(idx);
       setIsBuffering(true);
-      setCurrentTime(0);
+      setCurrentTime(resumeSeekSec > 0 ? resumeSeekSec : 0);
       setDuration(track.durationSeconds || 0);
       setLyrics(null);
       setSongDetail(null);
 
       playedIdsRef.current.add(track.videoId);
       setHistory((prev) => [track, ...prev.filter((t) => t.videoId !== track.videoId)].slice(0, 80));
+      if (!track.localFileUrl && !track.videoId.startsWith("local-")) {
+        recordPlayHistoryDb(track)
+          .then((persisted) => {
+            if (persisted.length > 0) setHistory(persisted);
+          })
+          .catch(() => {});
+      }
 
-      void loadMetadataAndLyrics(track, reqId, lyricsSourcePref);
+      void loadMetadataAndLyrics(track, reqId);
+      syncOsMediaSession(track, true, resumeSeekSec, track.durationSeconds || 0);
 
       const remaining = targetQueue.length - 1 - idx;
-      if (autoRadioRef.current && remaining <= 1 && !track.localFileUrl) {
+      if (!skipAutoRec && autoRadioRef.current && remaining <= 1 && !track.localFileUrl) {
         void appendRecommendations(track.videoId, false);
       } else if (idx + 1 < targetQueue.length && !targetQueue[idx + 1].localFileUrl) {
         prefetchStream(targetQueue[idx + 1].videoId, qualityRef.current).catch(() => {});
@@ -693,6 +905,16 @@ export default function App() {
         inAudio.src = playUrl;
         inAudio.currentTime = 0;
 
+        if (resumeSeekSec > 0) {
+          const applySeek = () => {
+            if (playRequestIdRef.current !== reqId) return;
+            if (Number.isFinite(inAudio.duration) && resumeSeekSec < inAudio.duration) {
+              inAudio.currentTime = resumeSeekSec;
+            }
+          };
+          inAudio.addEventListener("loadedmetadata", applySeek, { once: true });
+        }
+
         if (useCrossfade && audioCtxRef.current && outGain && inGain && incomingDeck !== outgoingDeck) {
           const fadeDur = Math.max(1.5, Math.min(12, crossfadeSecRef.current));
           const now = audioCtxRef.current.currentTime;
@@ -720,6 +942,7 @@ export default function App() {
           if (playRequestIdRef.current !== reqId) return;
           setIsPlaying(true);
           setIsBuffering(false);
+          syncOsMediaSession(track, true, inAudio.currentTime, inAudio.duration || track.durationSeconds);
 
           crossfadeCleanupTimerRef.current = window.setTimeout(() => {
             if (outAudio) {
@@ -738,11 +961,15 @@ export default function App() {
           if (playRequestIdRef.current !== reqId) return;
           setIsPlaying(true);
           setIsBuffering(false);
+          syncOsMediaSession(track, true, inAudio.currentTime, inAudio.duration || track.durationSeconds);
         }
+
+        window.setTimeout(() => void refreshEngineStatus(), 4000);
       } catch (err) {
         if (playRequestIdRef.current !== reqId) return;
         setIsBuffering(false);
         setIsPlaying(false);
+        syncOsMediaSession(track, false, 0, track.durationSeconds);
         showToast(`串流播放失敗 (${track.title}): ${String(err)}`, true);
       }
     },
@@ -753,14 +980,51 @@ export default function App() {
       eq.low,
       getStandbyDeck,
       loadMetadataAndLyrics,
-      lyricsSourcePref,
+      refreshEngineStatus,
       showToast,
       speakDjTransition,
+      syncOsMediaSession,
     ]
   );
 
   const playIndexRef = useRef(playQueueIndex);
   playIndexRef.current = playQueueIndex;
+
+  const playSingleTrack = useCallback(
+    (track: Track) => {
+      const lead = { ...track, isAutoRecommended: false };
+      const initialQueue = [lead];
+      queueRef.current = initialQueue;
+      setQueue(initialQueue);
+      void playQueueIndex(0, false, true);
+
+      if (!track.localFileUrl && !track.videoId.startsWith("local-")) {
+        const capturedReqId = playRequestIdRef.current;
+        setFetchingRecs(true);
+        getRecommendations(track.videoId)
+          .then((recs) => {
+            if (playRequestIdRef.current !== capturedReqId) return;
+            const filtered = recs
+              .filter((r) => r.videoId !== track.videoId)
+              .slice(0, 15)
+              .map((r) => ({ ...r, isAutoRecommended: true }));
+            if (filtered.length > 0) {
+              const nextQueue = [lead, ...filtered];
+              queueRef.current = nextQueue;
+              setQueue(nextQueue);
+              prefetchStream(filtered[0].videoId, qualityRef.current).catch(() => {});
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            if (playRequestIdRef.current === capturedReqId) {
+              setFetchingRecs(false);
+            }
+          });
+      }
+    },
+    [playQueueIndex]
+  );
 
   const playTrackFromList = useCallback(
     (track: Track, list?: Track[]) => {
@@ -891,7 +1155,41 @@ export default function App() {
       }
       return [{ ...track, isAutoRecommended: false }, ...prev];
     });
+    toggleFavoriteDb(track)
+      .then((persisted) => {
+        setFavorites(persisted);
+      })
+      .catch(() => {});
   }, []);
+
+  const handleDownloadTrack = useCallback(
+    async (track: Track) => {
+      if (track.localFileUrl || track.videoId.startsWith("local-")) {
+        showToast("此為本機音檔，無需下載");
+        return;
+      }
+      setDownloadingIds((prev) => {
+        const next = new Set(prev);
+        next.add(track.videoId);
+        return next;
+      });
+      showToast(`正在下載離線音檔並封裝封面與標籤: ${track.title}...`);
+      try {
+        const res = await downloadTrack(track, qualityRef.current);
+        showToast(`✅ 已離線儲存 (${res.format}): ${res.filePath}`);
+        void refreshEngineStatus();
+      } catch (err) {
+        showToast(`離線下載失敗 (${track.title}): ${String(err)}`, true);
+      } finally {
+        setDownloadingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(track.videoId);
+          return next;
+        });
+      }
+    },
+    [refreshEngineStatus, showToast]
+  );
 
   const handleNext = useCallback(
     async (allowCrossfade = false) => {
@@ -923,9 +1221,12 @@ export default function App() {
         await playQueueIndex(0, allowCrossfade);
       } else {
         setIsPlaying(false);
+        if (cur >= 0 && q[cur]) {
+          syncOsMediaSession(q[cur], false, 0, q[cur].durationSeconds);
+        }
       }
     },
-    [appendRecommendations, playQueueIndex, showToast]
+    [appendRecommendations, playQueueIndex, showToast, syncOsMediaSession]
   );
 
   const handlePrev = useCallback(() => {
@@ -933,6 +1234,14 @@ export default function App() {
     if (audio && audio.currentTime > 4) {
       audio.currentTime = 0;
       setCurrentTime(0);
+      if (currentTrack) {
+        syncOsMediaSession(
+          currentTrack,
+          !audio.paused,
+          0,
+          audio.duration || currentTrack.durationSeconds
+        );
+      }
       return;
     }
     const q = queueRef.current;
@@ -943,7 +1252,7 @@ export default function App() {
     } else if (repeatModeRef.current === "all") {
       void playQueueIndex(q.length - 1, false);
     }
-  }, [getActiveAudio, playQueueIndex]);
+  }, [currentTrack, getActiveAudio, playQueueIndex, syncOsMediaSession]);
 
   const togglePlayPause = useCallback(async () => {
     const audio = getActiveAudio();
@@ -954,35 +1263,105 @@ export default function App() {
       }
       return;
     }
+    if (!audio.src || audio.src === window.location.href) {
+      if (currentIndexRef.current >= 0) {
+        const resumePos = restoredSeekSecRef.current > 0 ? restoredSeekSecRef.current : 0;
+        await playQueueIndex(currentIndexRef.current, false, true, resumePos);
+      }
+      return;
+    }
     if (audio.paused) {
       ensureAudioGraph();
       try {
         await audio.play();
         setIsPlaying(true);
+        syncOsMediaSession(
+          currentTrack,
+          true,
+          audio.currentTime,
+          audio.duration || currentTrack.durationSeconds
+        );
       } catch {
         // ignore
       }
     } else {
       audio.pause();
       setIsPlaying(false);
+      syncOsMediaSession(
+        currentTrack,
+        false,
+        audio.currentTime,
+        audio.duration || currentTrack.durationSeconds
+      );
     }
-  }, [currentTrack, ensureAudioGraph, getActiveAudio, playQueueIndex]);
+  }, [currentTrack, ensureAudioGraph, getActiveAudio, playQueueIndex, syncOsMediaSession]);
+
+  const maybeTriggerCacheForAudio = useCallback(
+    (deck: "A" | "B", audioEl: HTMLAudioElement) => {
+      if (deck !== activeDeckRef.current) return;
+      if (cacheTriggeredReqRef.current === playRequestIdRef.current) return;
+      const track = queueRef.current[currentIndexRef.current];
+      if (!track || track.localFileUrl || track.videoId.startsWith("local-")) return;
+      const dur = audioEl.duration;
+      if (!Number.isFinite(dur) || dur <= 0) return;
+
+      const playedRatio = audioEl.currentTime / dur;
+      let maxBuffered = 0;
+      for (let i = 0; i < audioEl.buffered.length; i++) {
+        const end = audioEl.buffered.end(i);
+        if (end > maxBuffered) maxBuffered = end;
+      }
+      const bufferedRatio = maxBuffered / dur;
+
+      if (playedRatio >= 0.8 || bufferedRatio >= 0.8) {
+        cacheTriggeredReqRef.current = playRequestIdRef.current;
+        triggerAudioCache(track.videoId, qualityRef.current)
+          .then((cachedNow) => {
+            if (cachedNow) void refreshEngineStatus();
+          })
+          .catch(() => {});
+      }
+    },
+    [refreshEngineStatus]
+  );
 
   const handleTrackEnded = useCallback(
     async (deck: "A" | "B") => {
       if (deck !== activeDeckRef.current) return;
+      const finishedTrack = queueRef.current[currentIndexRef.current];
+      if (
+        finishedTrack &&
+        !finishedTrack.localFileUrl &&
+        !finishedTrack.videoId.startsWith("local-") &&
+        cacheTriggeredReqRef.current !== playRequestIdRef.current
+      ) {
+        cacheTriggeredReqRef.current = playRequestIdRef.current;
+        triggerAudioCache(finishedTrack.videoId, qualityRef.current)
+          .then((cachedNow) => {
+            if (cachedNow) void refreshEngineStatus();
+          })
+          .catch(() => {});
+      }
       if (repeatModeRef.current === "one") {
         const audio = getActiveAudio();
         if (audio) {
           audio.currentTime = 0;
           await audio.play().catch(() => {});
           setIsPlaying(true);
+          if (finishedTrack) {
+            syncOsMediaSession(
+              finishedTrack,
+              true,
+              0,
+              audio.duration || finishedTrack.durationSeconds
+            );
+          }
         }
         return;
       }
       await handleNext(false);
     },
-    [getActiveAudio, handleNext]
+    [getActiveAudio, handleNext, refreshEngineStatus, syncOsMediaSession]
   );
 
   const handleTimeUpdateForDeck = useCallback(
@@ -991,6 +1370,21 @@ export default function App() {
       const curTime = audioEl.currentTime;
       const dur = audioEl.duration;
       setCurrentTime(curTime);
+      maybeTriggerCacheForAudio(deck, audioEl);
+
+      const nowMs = Date.now();
+      if (nowMs - lastSmtcSyncAtRef.current >= 4000) {
+        lastSmtcSyncAtRef.current = nowMs;
+        const track = queueRef.current[currentIndexRef.current];
+        if (track) {
+          syncOsMediaSession(
+            track,
+            !audioEl.paused,
+            curTime,
+            Number.isFinite(dur) ? dur : track.durationSeconds
+          );
+        }
+      }
 
       // Automatic Crossfade transition before track end when DJ Mode or Crossfade > 0
       const effectiveFade = djEnabledRef.current
@@ -1018,7 +1412,7 @@ export default function App() {
         }
       }
     },
-    [playQueueIndex]
+    [maybeTriggerCacheForAudio, playQueueIndex, syncOsMediaSession]
   );
 
   const startDjVibe = useCallback(
@@ -1037,11 +1431,24 @@ export default function App() {
           return;
         }
         const shuffled = [...tracks].sort(() => Math.random() - 0.5);
-        const djQueue = shuffled.map((t) => ({ ...t, isAutoRecommended: true }));
+        const seed = shuffled[0];
+        let recs: Track[] = [];
+        if (seed && !seed.localFileUrl) {
+          recs = await getRecommendations(seed.videoId).catch(() => []);
+        }
+        const seen = new Set<string>([seed.videoId]);
+        const merged: Track[] = [seed];
+        for (const t of [...recs, ...shuffled.slice(1)]) {
+          if (!seen.has(t.videoId)) {
+            seen.add(t.videoId);
+            merged.push(t);
+          }
+        }
+        const djQueue = merged.map((t) => ({ ...t, isAutoRecommended: true }));
         queueRef.current = djQueue;
         setQueue(djQueue);
         speakDjTransition(djQueue[0], vibe.label);
-        await playQueueIndex(0, isPlaying);
+        await playQueueIndex(0, isPlaying, true);
       } catch (err) {
         showToast(`啟動 AI DJ Mix 失敗: ${String(err)}`, true);
       } finally {
@@ -1111,32 +1518,6 @@ export default function App() {
     [searchFilter, searchQuery, showToast]
   );
 
-  const handleSwitchLyricsSource = useCallback(
-    async (pref: LyricsSourcePreference) => {
-      setLyricsSourcePref(pref);
-      if (!currentTrack || currentTrack.localFileUrl) return;
-      const reqId = playRequestIdRef.current;
-      setLyricsLoading(true);
-      try {
-        const lyr = await getLyrics(
-          currentTrack.videoId,
-          currentTrack.title,
-          currentTrack.artist,
-          currentTrack.durationSeconds,
-          pref
-        );
-        if (playRequestIdRef.current === reqId) {
-          setLyrics(lyr);
-        }
-      } finally {
-        if (playRequestIdRef.current === reqId) {
-          setLyricsLoading(false);
-        }
-      }
-    },
-    [currentTrack]
-  );
-
   const seekTo = useCallback(
     (sec: number) => {
       const audio = getActiveAudio();
@@ -1144,17 +1525,59 @@ export default function App() {
       const clamped = Math.max(0, Math.min(sec, audio.duration || sec));
       audio.currentTime = clamped;
       setCurrentTime(clamped);
+      if (currentTrack) {
+        syncOsMediaSession(
+          currentTrack,
+          isPlaying,
+          clamped,
+          audio.duration || currentTrack.durationSeconds
+        );
+      }
     },
-    [getActiveAudio]
+    [currentTrack, getActiveAudio, isPlaying, syncOsMediaSession]
   );
 
   const cycleRepeatMode = useCallback(() => {
     setRepeatMode((prev) => (prev === "off" ? "all" : prev === "all" ? "one" : "off"));
   }, []);
 
-  // Keyboard shortcuts
+  const togglePlayPauseRef = useRef(togglePlayPause);
+  togglePlayPauseRef.current = togglePlayPause;
+  const handleNextRef = useRef(handleNext);
+  handleNextRef.current = handleNext;
+  const handlePrevRef = useRef(handlePrev);
+  handlePrevRef.current = handlePrev;
+  const seekToRef = useRef(seekTo);
+  seekToRef.current = seekTo;
+  const persistSnapshotRef = useRef(persistSnapshot);
+  persistSnapshotRef.current = persistSnapshot;
+
+  // Keyboard & hardware media key shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "MediaTrackNext") {
+        e.preventDefault();
+        void handleNextRef.current(false);
+        return;
+      }
+      if (e.key === "MediaTrackPrevious") {
+        e.preventDefault();
+        handlePrevRef.current();
+        return;
+      }
+      if (e.key === "MediaPlayPause") {
+        e.preventDefault();
+        void togglePlayPauseRef.current();
+        return;
+      }
+      if (e.key === "MediaStop") {
+        e.preventDefault();
+        const audio = getActiveAudio();
+        if (audio) audio.pause();
+        setIsPlaying(false);
+        return;
+      }
+
       const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
       if (tag === "input" || tag === "textarea" || tag === "select") return;
 
@@ -1171,7 +1594,98 @@ export default function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [currentTime, seekTo, togglePlayPause]);
+  }, [currentTime, getActiveAudio, seekTo, togglePlayPause]);
+
+  // OS Media Controls (Windows SMTC + Chromium/WebView MediaSession + Tauri tray/close flush)
+  useEffect(() => {
+    try {
+      if ("mediaSession" in navigator) {
+        const ms = navigator.mediaSession;
+        ms.setActionHandler("play", () => {
+          const audio = getActiveAudio();
+          if (!audio || audio.paused) {
+            void togglePlayPauseRef.current();
+          }
+        });
+        ms.setActionHandler("pause", () => {
+          const audio = getActiveAudio();
+          if (audio && !audio.paused) {
+            void togglePlayPauseRef.current();
+          }
+        });
+        ms.setActionHandler("previoustrack", () => handlePrevRef.current());
+        ms.setActionHandler("nexttrack", () => void handleNextRef.current(false));
+        ms.setActionHandler("seekto", (details) => {
+          if (typeof details.seekTime === "number") {
+            seekToRef.current(details.seekTime);
+          }
+        });
+        ms.setActionHandler("seekbackward", (details) => {
+          const cur = getActiveAudio()?.currentTime ?? 0;
+          seekToRef.current(cur - (details.seekOffset || 10));
+        });
+        ms.setActionHandler("seekforward", (details) => {
+          const cur = getActiveAudio()?.currentTime ?? 0;
+          seekToRef.current(cur + (details.seekOffset || 10));
+        });
+      }
+    } catch {
+      // ignore unsupported MediaSession action handlers
+    }
+
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+
+    void (async () => {
+      try {
+        if (cancelled) return;
+        const u1 = await listen<string>("smtc-action", (event) => {
+          const action = event.payload;
+          const audio = getActiveAudio();
+          if (action === "play") {
+            if (!audio || audio.paused) void togglePlayPauseRef.current();
+          } else if (action === "pause" || action === "stop") {
+            if (audio && !audio.paused) void togglePlayPauseRef.current();
+          } else if (action === "toggle") {
+            void togglePlayPauseRef.current();
+          } else if (action === "next") {
+            void handleNextRef.current(djEnabledRef.current || crossfadeSecRef.current > 0);
+          } else if (action === "prev") {
+            handlePrevRef.current();
+          }
+        });
+        const u2 = await listen<number>("smtc-seek", (event) => {
+          if (typeof event.payload === "number") {
+            seekToRef.current(event.payload);
+          }
+        });
+        const u3 = await listen<number>("smtc-seek-relative", (event) => {
+          if (typeof event.payload === "number") {
+            const cur = getActiveAudio()?.currentTime ?? 0;
+            seekToRef.current(cur + event.payload);
+          }
+        });
+        const u4 = await listen("app-will-close", () => {
+          persistSnapshotRef.current();
+        });
+        if (cancelled) {
+          u1();
+          u2();
+          u3();
+          u4();
+        } else {
+          unlisteners.push(u1, u2, u3, u4);
+        }
+      } catch {
+        // non-Tauri browser preview environment
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      for (const unlisten of unlisteners) unlisten();
+    };
+  }, [getActiveAudio]);
 
   // Compute active lyric line index
   const activeLyricIndex = useMemo(() => {
@@ -1201,6 +1715,74 @@ export default function App() {
   const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
   const volumePct = (muted ? 0 : volume) * 100;
 
+  const createDeckHandlers = (deck: "A" | "B") => ({
+    onTimeUpdate: (e: React.SyntheticEvent<HTMLAudioElement>) =>
+      handleTimeUpdateForDeck(deck, e.currentTarget),
+    onProgress: (e: React.SyntheticEvent<HTMLAudioElement>) =>
+      maybeTriggerCacheForAudio(deck, e.currentTarget),
+    onDurationChange: (e: React.SyntheticEvent<HTMLAudioElement>) => {
+      if (activeDeckRef.current === deck) {
+        const d = e.currentTarget.duration;
+        if (Number.isFinite(d) && d > 0) setDuration(d);
+      }
+    },
+    onPlaying: (e: React.SyntheticEvent<HTMLAudioElement>) => {
+      if (activeDeckRef.current !== deck) return;
+      setIsPlaying(true);
+      setIsBuffering(false);
+      const track = queueRef.current[currentIndexRef.current];
+      if (track) {
+        syncOsMediaSession(
+          track,
+          true,
+          e.currentTarget.currentTime,
+          e.currentTarget.duration || track.durationSeconds
+        );
+      }
+    },
+    onPause: (e: React.SyntheticEvent<HTMLAudioElement>) => {
+      if (activeDeckRef.current !== deck || crossfadeActive) return;
+      setIsPlaying(false);
+      const track = queueRef.current[currentIndexRef.current];
+      if (track) {
+        syncOsMediaSession(
+          track,
+          false,
+          e.currentTarget.currentTime,
+          e.currentTarget.duration || track.durationSeconds
+        );
+      }
+      persistSnapshot();
+    },
+    onWaiting: () => {
+      if (activeDeckRef.current === deck) setIsBuffering(true);
+    },
+    onCanPlay: () => {
+      if (activeDeckRef.current === deck) setIsBuffering(false);
+    },
+    onEnded: () => void handleTrackEnded(deck),
+    onError: (e: React.SyntheticEvent<HTMLAudioElement>) => {
+      const el = e.currentTarget;
+      if (
+        activeDeckRef.current === deck &&
+        streamInfo?.directUrl &&
+        el.src !== streamInfo.directUrl &&
+        !el.src.startsWith("blob:")
+      ) {
+        el.src = streamInfo.directUrl;
+        void el.play().catch(() => {
+          setIsBuffering(false);
+          setIsPlaying(false);
+        });
+        return;
+      }
+      if (activeDeckRef.current === deck) {
+        setIsBuffering(false);
+        setIsPlaying(false);
+      }
+    },
+  });
+
   return (
     <div className="app-shell" data-glass={glassMode}>
       {showSplash && <StartupSplash onFinish={() => setShowSplash(false)} />}
@@ -1220,97 +1802,13 @@ export default function App() {
         ref={audioARef}
         crossOrigin="anonymous"
         preload="auto"
-        onTimeUpdate={(e) => handleTimeUpdateForDeck("A", e.currentTarget)}
-        onDurationChange={(e) => {
-          if (activeDeckRef.current === "A") {
-            const d = e.currentTarget.duration;
-            if (Number.isFinite(d) && d > 0) setDuration(d);
-          }
-        }}
-        onPlaying={() => {
-          if (activeDeckRef.current === "A") {
-            setIsPlaying(true);
-            setIsBuffering(false);
-          }
-        }}
-        onPause={() => {
-          if (activeDeckRef.current === "A" && !crossfadeActive) setIsPlaying(false);
-        }}
-        onWaiting={() => {
-          if (activeDeckRef.current === "A") setIsBuffering(true);
-        }}
-        onCanPlay={() => {
-          if (activeDeckRef.current === "A") setIsBuffering(false);
-        }}
-        onEnded={() => void handleTrackEnded("A")}
-        onError={(e) => {
-          const el = e.currentTarget;
-          if (
-            activeDeckRef.current === "A" &&
-            streamInfo?.directUrl &&
-            el.src !== streamInfo.directUrl &&
-            !el.src.startsWith("blob:")
-          ) {
-            el.src = streamInfo.directUrl;
-            void el.play().catch(() => {
-              setIsBuffering(false);
-              setIsPlaying(false);
-            });
-            return;
-          }
-          if (activeDeckRef.current === "A") {
-            setIsBuffering(false);
-            setIsPlaying(false);
-          }
-        }}
+        {...createDeckHandlers("A")}
       />
       <audio
         ref={audioBRef}
         crossOrigin="anonymous"
         preload="auto"
-        onTimeUpdate={(e) => handleTimeUpdateForDeck("B", e.currentTarget)}
-        onDurationChange={(e) => {
-          if (activeDeckRef.current === "B") {
-            const d = e.currentTarget.duration;
-            if (Number.isFinite(d) && d > 0) setDuration(d);
-          }
-        }}
-        onPlaying={() => {
-          if (activeDeckRef.current === "B") {
-            setIsPlaying(true);
-            setIsBuffering(false);
-          }
-        }}
-        onPause={() => {
-          if (activeDeckRef.current === "B" && !crossfadeActive) setIsPlaying(false);
-        }}
-        onWaiting={() => {
-          if (activeDeckRef.current === "B") setIsBuffering(true);
-        }}
-        onCanPlay={() => {
-          if (activeDeckRef.current === "B") setIsBuffering(false);
-        }}
-        onEnded={() => void handleTrackEnded("B")}
-        onError={(e) => {
-          const el = e.currentTarget;
-          if (
-            activeDeckRef.current === "B" &&
-            streamInfo?.directUrl &&
-            el.src !== streamInfo.directUrl &&
-            !el.src.startsWith("blob:")
-          ) {
-            el.src = streamInfo.directUrl;
-            void el.play().catch(() => {
-              setIsBuffering(false);
-              setIsPlaying(false);
-            });
-            return;
-          }
-          if (activeDeckRef.current === "B") {
-            setIsBuffering(false);
-            setIsPlaying(false);
-          }
-        }}
+        {...createDeckHandlers("B")}
       />
 
       <div className={`main-workspace ${sidePanelOpen ? "" : "panel-collapsed"}`}>
@@ -1656,7 +2154,13 @@ export default function App() {
                                     type="button"
                                     className="card-play-fab"
                                     title="立即串流播放"
-                                    onClick={() => playTrackFromList(track, sec.tracks)}
+                                    onClick={() => {
+                                      if (isCurrent) {
+                                        void togglePlayPause();
+                                      } else {
+                                        playSingleTrack(track);
+                                      }
+                                    }}
                                   >
                                     {isCurrent && isPlaying ? (
                                       <Pause size={16} fill="currentColor" />
@@ -1738,10 +2242,12 @@ export default function App() {
                     tracks={searchResults}
                     currentVideoId={currentTrack?.videoId}
                     favoriteIds={favoriteIds}
-                    onPlayTrack={(t) => playTrackFromList(t, searchResults)}
+                    downloadingIds={downloadingIds}
+                    onPlayTrack={(t) => playSingleTrack(t)}
                     onPlayNext={addTrackNext}
                     onAddToQueue={addTrackToQueue}
                     onToggleFavorite={toggleFavorite}
+                    onDownloadTrack={handleDownloadTrack}
                   />
                 ) : (
                   <div className="empty-state">
@@ -1778,6 +2284,7 @@ export default function App() {
                     speakDjTransition(currentTrack, vibeLabel);
                   }
                 }}
+                onTriggerCrossfadeNext={() => void handleNext(true)}
                 onImportLocalLossless={handleImportLocalLossless}
               />
             )}
@@ -1823,27 +2330,6 @@ export default function App() {
 
                   <SpectrumCanvas analyser={analyser} isPlaying={isPlaying} variant="stage" />
 
-                  <div className="lyrics-tools">
-                    {(
-                      [
-                        ["auto", "自動最佳"],
-                        ["lrclib", "LRCLIB 時間軸"],
-                        ["ytmapi", "YTMAPI 官方"],
-                        ["ytdlp", "yt-dlp 字幕"],
-                      ] as const
-                    ).map(([srcKey, label]) => (
-                      <button
-                        key={srcKey}
-                        type="button"
-                        className={`chip-btn ${lyricsSourcePref === srcKey ? "active" : ""}`}
-                        onClick={() => void handleSwitchLyricsSource(srcKey)}
-                        disabled={!currentTrack || lyricsLoading || Boolean(currentTrack?.localFileUrl)}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-
                   {lyrics?.hasSynced && (
                     <div className="lyrics-tools" style={{ alignItems: "center" }}>
                       <button
@@ -1879,8 +2365,9 @@ export default function App() {
                 <div className="lyrics-right-col">
                   <div className="lyrics-right-header">
                     <span>
-                      來源：<strong>{lyrics?.source || "待載入"}</strong>
-                      {lyrics?.hasSynced ? " (點擊任一句即可跳轉時間)" : ""}
+                      {lyrics?.hasSynced
+                        ? "時間軸同步歌詞 (點擊任一句即可跳轉時間)"
+                        : "動態歌詞"}
                     </span>
                     {lyricsLoading && <Loader2 size={14} className="spin" />}
                   </div>
@@ -1894,7 +2381,7 @@ export default function App() {
                     ) : lyricsLoading ? (
                       <div className="empty-state">
                         <Loader2 size={28} className="spin" />
-                        <div>正在抓取多來源歌詞 (LRCLIB / YTMAPI / yt-dlp)...</div>
+                        <div>正在智慧比對並載入最佳同步歌詞...</div>
                       </div>
                     ) : lyrics?.hasSynced && lyrics.syncedLines.length > 0 ? (
                       lyrics.syncedLines.map((line, i) => {
@@ -1916,7 +2403,7 @@ export default function App() {
                     ) : (
                       <div className="empty-state">
                         <Mic2 size={32} />
-                        <div>此曲目暫無可用歌詞，可嘗試切換上方的歌詞來源。</div>
+                        <div>此曲目暫無可用歌詞</div>
                       </div>
                     )}
                   </div>
@@ -1970,10 +2457,12 @@ export default function App() {
                     tracks={queue}
                     currentVideoId={currentTrack?.videoId}
                     favoriteIds={favoriteIds}
+                    downloadingIds={downloadingIds}
                     onPlayTrack={(_, idx) => void playQueueIndex(idx, false)}
                     onPlayNext={addTrackNext}
                     onAddToQueue={addTrackToQueue}
                     onToggleFavorite={toggleFavorite}
+                    onDownloadTrack={handleDownloadTrack}
                     onRemoveAt={removeFromQueue}
                     showAutoBadge
                   />
@@ -2012,10 +2501,12 @@ export default function App() {
                       tracks={favorites}
                       currentVideoId={currentTrack?.videoId}
                       favoriteIds={favoriteIds}
+                      downloadingIds={downloadingIds}
                       onPlayTrack={(t) => playTrackFromList(t, favorites)}
                       onPlayNext={addTrackNext}
                       onAddToQueue={addTrackToQueue}
                       onToggleFavorite={toggleFavorite}
+                      onDownloadTrack={handleDownloadTrack}
                     />
                   )}
                 </section>
@@ -2031,7 +2522,10 @@ export default function App() {
                         type="button"
                         className="secondary-btn"
                         style={{ padding: "6px 12px", fontSize: 12 }}
-                        onClick={() => setHistory([])}
+                        onClick={() => {
+                          setHistory([]);
+                          void clearPlayHistoryDb().catch(() => {});
+                        }}
                       >
                         <Trash2 size={13} />
                         清除紀錄
@@ -2048,10 +2542,12 @@ export default function App() {
                       tracks={history}
                       currentVideoId={currentTrack?.videoId}
                       favoriteIds={favoriteIds}
+                      downloadingIds={downloadingIds}
                       onPlayTrack={(t) => playTrackFromList(t, history)}
                       onPlayNext={addTrackNext}
                       onAddToQueue={addTrackToQueue}
                       onToggleFavorite={toggleFavorite}
+                      onDownloadTrack={handleDownloadTrack}
                     />
                   )}
                 </section>
@@ -2125,6 +2621,79 @@ export default function App() {
                       </div>
                     </>
                   )}
+
+                  <div className="auto-radio-card" style={{ marginTop: 4 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                        關閉視窗時縮小至系統匣 (背景播放)
+                      </div>
+                      <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 2 }}>
+                        點擊右上角關閉時保留常駐列與系統媒體控制
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`toggle-switch ${closeToTray ? "on" : ""}`}
+                      onClick={() => {
+                        const next = !closeToTray;
+                        setCloseToTray(next);
+                        void setCloseToTrayCmd(next).catch(() => {});
+                        showToast(next ? "已啟用縮小至系統匣背景播放" : "關閉視窗時將直接退出程式");
+                      }}
+                      aria-label="切換關閉時最小化至系統匣"
+                    >
+                      <span className="toggle-knob" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Audio Cache Stats Panel */}
+                <div className="panel-card">
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <HardDrive size={18} style={{ color: "var(--accent-secondary)" }} />
+                      <h3 style={{ margin: 0, fontSize: 16 }}>音訊智慧快取與離線空間</h3>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      style={{ padding: "6px 11px", fontSize: 12 }}
+                      onClick={() => {
+                        void clearAudioCache()
+                          .then(() => {
+                            showToast("已清空本機串流音訊快取");
+                            void refreshEngineStatus();
+                          })
+                          .catch((err) => showToast(`清理快取失敗: ${String(err)}`, true));
+                      }}
+                    >
+                      <Trash2 size={13} />
+                      清理音訊快取
+                    </button>
+                  </div>
+
+                  <div className="info-kv">
+                    <span className="info-k">已快取曲目數</span>
+                    <span className="info-v tabular-nums">
+                      {cacheStats ? `${cacheStats.entryCount} 首` : "統計中..."}
+                    </span>
+                  </div>
+                  <div className="info-kv">
+                    <span className="info-k">快取佔用空間 / LRU 上限</span>
+                    <span className="info-v tabular-nums">
+                      {cacheStats
+                        ? `${formatBytes(cacheStats.totalBytes)} / ${formatBytes(cacheStats.maxBytes)}`
+                        : "0 B / 2.00 GB"}
+                    </span>
+                  </div>
+                  {cacheStats?.cacheDir && (
+                    <div className="code-pill" title={cacheStats.cacheDir}>
+                      {cacheStats.cacheDir}
+                    </div>
+                  )}
+                  <p style={{ margin: 0, fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.55 }}>
+                    播放達 80% 或完整緩衝後自動寫入本機快取，重播秒開零等待；超出上限時自動依 LRU 機制清除最久未播音檔。
+                  </p>
                 </div>
 
                 {/* Auto-Updater Panel */}
@@ -2340,6 +2909,24 @@ export default function App() {
                               </span>
                             )}
                           </div>
+                          {!track.localFileUrl && !track.videoId.startsWith("local-") && (
+                            <button
+                              type="button"
+                              className="action-icon-btn"
+                              title="下載離線音檔 (含封面與標籤)"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleDownloadTrack(track);
+                              }}
+                              disabled={downloadingIds.has(track.videoId)}
+                            >
+                              {downloadingIds.has(track.videoId) ? (
+                                <Loader2 size={13} className="spin" />
+                              ) : (
+                                <Download size={13} />
+                              )}
+                            </button>
+                          )}
                           <button
                             type="button"
                             className="action-icon-btn"
@@ -2369,9 +2956,6 @@ export default function App() {
                     </div>
                   ) : lyrics?.hasSynced && lyrics.syncedLines.length > 0 ? (
                     <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "8px 4px" }}>
-                      <div style={{ fontSize: 11, color: "var(--text-muted)", textAlign: "center" }}>
-                        來源: {lyrics.source}
-                      </div>
                       {lyrics.syncedLines.map((line, i) => {
                         const active = i === activeLyricIndex;
                         return (
@@ -2468,7 +3052,7 @@ export default function App() {
                             <div
                               key={rel.videoId}
                               className="queue-item"
-                              onClick={() => playTrackFromList(rel)}
+                              onClick={() => playSingleTrack(rel)}
                               style={{ cursor: "pointer" }}
                             >
                               <AlbumArt
@@ -2555,6 +3139,21 @@ export default function App() {
                   fill={favoriteIds.has(currentTrack.videoId) ? "currentColor" : "none"}
                 />
               </button>
+              {!currentTrack.localFileUrl && !currentTrack.videoId.startsWith("local-") && (
+                <button
+                  type="button"
+                  className="action-icon-btn"
+                  title="下載離線音檔 (含封面與標籤)"
+                  onClick={() => void handleDownloadTrack(currentTrack)}
+                  disabled={downloadingIds.has(currentTrack.videoId)}
+                >
+                  {downloadingIds.has(currentTrack.videoId) ? (
+                    <Loader2 size={15} className="spin" />
+                  ) : (
+                    <Download size={15} />
+                  )}
+                </button>
+              )}
             </>
           ) : (
             <div className="player-track-meta">

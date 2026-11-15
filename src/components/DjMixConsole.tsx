@@ -86,6 +86,7 @@ interface DjMixConsoleProps {
   onChangeCrossfadeSec: (sec: number) => void;
   onChangeEq: (next: EqSettings) => void;
   onSpeakNow: () => void;
+  onTriggerCrossfadeNext: () => void;
   onImportLocalLossless: (files: FileList | null) => void;
 }
 
@@ -108,6 +109,7 @@ export function DjMixConsole({
   onChangeCrossfadeSec,
   onChangeEq,
   onSpeakNow,
+  onTriggerCrossfadeNext,
   onImportLocalLossless,
 }: DjMixConsoleProps) {
   const activeVibe = DJ_VIBES.find((v) => v.id === djVibe) ?? DJ_VIBES[0];
@@ -174,6 +176,15 @@ export function DjMixConsole({
             >
               <Volume2 size={14} />
               試聽 DJ 導聆
+            </button>
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={onTriggerCrossfadeNext}
+              disabled={!currentTrack || !nextTrack}
+            >
+              <AudioWaveform size={14} />
+              立即無縫混音切歌
             </button>
           </div>
         </div>

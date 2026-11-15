@@ -88,6 +88,44 @@ export interface UpdateActionResult {
   releaseUrl: string;
 }
 
+export interface DownloadResult {
+  filePath: string;
+  sizeBytes: number;
+  format: string;
+  hasCoverArt: boolean;
+  hasMetadataTags: boolean;
+}
+
+export interface CacheStats {
+  cacheDir: string;
+  entryCount: number;
+  totalBytes: number;
+  maxBytes: number;
+}
+
+export interface PersistedSettings {
+  volume: number;
+  autoRadio: boolean;
+  repeatMode: RepeatMode;
+  shuffle: boolean;
+  audioQuality: AudioQuality;
+  glassMode: GlassMode;
+  crossfadeSec: number;
+  djVoiceEnabled: boolean;
+  djVibe: DjVibeId;
+  eq: EqSettings;
+  closeToTray: boolean;
+}
+
+export interface UserStore {
+  favorites: Track[];
+  history: Track[];
+  lastQueue: Track[];
+  lastIndex: number;
+  lastPositionSec: number;
+  settings: PersistedSettings;
+}
+
 export type NavTab = "home" | "search" | "dj" | "lyrics" | "queue" | "library" | "settings";
 export type SidePanelTab = "queue" | "lyrics" | "info";
 export type RepeatMode = "off" | "all" | "one";

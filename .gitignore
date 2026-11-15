@@ -24,3 +24,7 @@ Thumbs.db
 .idea
 *.swp
 *.swo
+
+# Local acceptance checklist (never push to GitHub)
+DONE_CRITERIA.md
+

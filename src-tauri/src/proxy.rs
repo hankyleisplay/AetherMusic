@@ -1,8 +1,10 @@
+use crate::cache;
 use crate::models::AppState;
 use crate::ytdlp;
 use futures_util::StreamExt;
+use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 pub async fn start_proxy_server(state: AppState) -> Result<u16, String> {
@@ -155,7 +157,29 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let mut cached = match ytdlp::get_or_extract_stream(&state, video_id, quality).await {
+    if let Some((cached_path, entry)) = cache::get_cached_audio(&state, video_id).await {
+        let _ = serve_cached_file(
+            &mut socket,
+            &method,
+            &cached_path,
+            &entry.mime_type,
+            range_header.as_deref(),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Spawn non-blocking background auto-cache so subsequent plays hit local disk cache
+    {
+        let bg_state = state.clone();
+        let bg_vid = video_id.to_string();
+        let bg_quality = quality.to_string();
+        tokio::spawn(async move {
+            let _ = cache::cache_audio_stream(&bg_state, &bg_vid, &bg_quality).await;
+        });
+    }
+
+    let mut cached = match ytdlp::extract_stream_network(&state, video_id, quality).await {
         Ok(c) => c,
         Err(err) => {
             let _ = write_simple_response(
@@ -173,7 +197,7 @@ async fn handle_connection(
     if let Ok(ref resp) = upstream_resp {
         if resp.status().as_u16() == 403 || resp.status().as_u16() == 410 {
             ytdlp::invalidate_stream_cache(&state, video_id).await;
-            if let Ok(fresh) = ytdlp::get_or_extract_stream(&state, video_id, quality).await {
+            if let Ok(fresh) = ytdlp::extract_stream_network(&state, video_id, quality).await {
                 cached = fresh;
                 upstream_resp = send_upstream(&client, &method, &cached.direct_url, range_header.as_deref()).await;
             }
@@ -281,4 +305,94 @@ async fn send_upstream(
     req.send()
         .await
         .map_err(|e| format!("Upstream audio stream error: {e}"))
+}
+
+async fn serve_cached_file(
+    socket: &mut TcpStream,
+    method: &str,
+    path: &Path,
+    mime_type: &str,
+    range: Option<&str>,
+) -> std::io::Result<()> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => {
+            return write_simple_response(socket, "404 Not Found", "text/plain", b"Cache miss").await;
+        }
+    };
+    let total_len = file.metadata().await?.len();
+    if total_len == 0 {
+        return write_simple_response(socket, "404 Not Found", "text/plain", b"Empty cache").await;
+    }
+
+    let (status_line, start, end) = if let Some(r_hdr) = range {
+        if let Some(spec) = r_hdr.strip_prefix("bytes=") {
+            let parts: Vec<&str> = spec.split('-').collect();
+            let s = parts
+                .first()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            let e = parts
+                .get(1)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(total_len.saturating_sub(1))
+                .min(total_len.saturating_sub(1));
+            if s <= e && s < total_len {
+                ("206 Partial Content", s, e)
+            } else {
+                ("416 Range Not Satisfiable", 0, 0)
+            }
+        } else {
+            ("200 OK", 0, total_len.saturating_sub(1))
+        }
+    } else {
+        ("200 OK", 0, total_len.saturating_sub(1))
+    };
+
+    if status_line.starts_with("416") {
+        let headers = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\n\
+             Content-Range: bytes */{total_len}\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Connection: close\r\n\r\n"
+        );
+        socket.write_all(headers.as_bytes()).await?;
+        return socket.flush().await;
+    }
+
+    let chunk_len = end - start + 1;
+    let mut header_buf = format!(
+        "HTTP/1.1 {status_line}\r\n\
+         Content-Type: {mime_type}\r\n\
+         Accept-Ranges: bytes\r\n\
+         Content-Length: {chunk_len}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Range, Content-Type\r\n\
+         Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n\
+         X-Aether-Cache: HIT\r\n"
+    );
+    if status_line.starts_with("206") {
+        header_buf.push_str(&format!("Content-Range: bytes {start}-{end}/{total_len}\r\n"));
+    }
+    header_buf.push_str("Connection: close\r\n\r\n");
+
+    socket.write_all(header_buf.as_bytes()).await?;
+    if method == "HEAD" {
+        return socket.flush().await;
+    }
+
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut reader = file.take(chunk_len);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if socket.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+    }
+    socket.flush().await
 }

@@ -1,16 +1,20 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AudioQuality,
+  CacheStats,
+  DownloadResult,
   EngineStatus,
   HomeSection,
   LyricsResponse,
   LyricsSourcePreference,
+  PersistedSettings,
   SearchFilter,
   SongMetadata,
   StreamInfo,
   Track,
   UpdateActionResult,
   UpdateStatus,
+  UserStore,
 } from "./types";
 
 export async function searchMusic(
@@ -72,4 +76,67 @@ export async function checkForUpdates(): Promise<UpdateStatus> {
 
 export async function runCoreUpdate(): Promise<UpdateActionResult> {
   return invoke<UpdateActionResult>("run_core_update");
+}
+
+export async function triggerAudioCache(
+  videoId: string,
+  quality: AudioQuality = "lossless"
+): Promise<boolean> {
+  return invoke<boolean>("trigger_audio_cache", { videoId, quality });
+}
+
+export async function getCacheStats(): Promise<CacheStats> {
+  return invoke<CacheStats>("get_cache_stats");
+}
+
+export async function clearAudioCache(): Promise<void> {
+  return invoke<void>("clear_audio_cache");
+}
+
+export async function downloadTrack(
+  track: Track,
+  quality: AudioQuality = "high"
+): Promise<DownloadResult> {
+  return invoke<DownloadResult>("download_track", { track, quality });
+}
+
+export async function setCloseToTray(enabled: boolean): Promise<void> {
+  return invoke<void>("set_close_to_tray", { enabled });
+}
+
+export async function updateMediaSession(params: {
+  title: string;
+  artist: string;
+  album: string;
+  coverUrl: string | null;
+  durationSecs: number;
+  positionSecs: number;
+  isPlaying: boolean;
+}): Promise<void> {
+  return invoke<void>("update_media_session", params);
+}
+
+export async function loadUserStore(): Promise<UserStore> {
+  return invoke<UserStore>("load_user_store");
+}
+
+export async function toggleFavoriteDb(track: Track): Promise<Track[]> {
+  return invoke<Track[]>("toggle_favorite_db", { track });
+}
+
+export async function recordPlayHistoryDb(track: Track): Promise<Track[]> {
+  return invoke<Track[]>("record_play_history_db", { track });
+}
+
+export async function clearPlayHistoryDb(): Promise<void> {
+  return invoke<void>("clear_play_history_db");
+}
+
+export async function savePlaybackSnapshot(params: {
+  queue: Track[];
+  currentIndex: number;
+  positionSec: number;
+  settings: PersistedSettings;
+}): Promise<void> {
+  return invoke<void>("save_playback_snapshot", params);
 }
