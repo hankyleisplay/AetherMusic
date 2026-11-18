@@ -241,12 +241,15 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release-upload/* --clobber
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-upload/* --repo "$GH_REPO" --clobber
           else
             gh release create "$TAG" release-upload/* \
+              --repo "$GH_REPO" \
+              --target "${{ github.sha }}" \
               --title "AetherMusic $TAG" \
               --generate-notes
           fi
