@@ -59,6 +59,10 @@ import {
 } from "./api";
 import { AlbumArt } from "./components/AlbumArt";
 import { DJ_VIBES, DjMixConsole, type DjVibeOption } from "./components/DjMixConsole";
+import {
+  LiquidGlassFilters,
+  supportsBackdropSvgRefraction,
+} from "./components/LiquidGlassFilters";
 import { SpectrumCanvas } from "./components/SpectrumCanvas";
 import { StartupSplash } from "./components/StartupSplash";
 import { TrackTable } from "./components/TrackTable";
@@ -248,6 +252,9 @@ export default function App() {
   const playedIdsRef = useRef<Set<string>>(new Set());
   const recInFlightRef = useRef<boolean>(false);
 
+  const appShellRef = useRef<HTMLDivElement | null>(null);
+  const svgRefractSupported = useMemo(() => supportsBackdropSvgRefraction(), []);
+
   const lyricsMainActiveRef = useRef<HTMLButtonElement | null>(null);
   const lyricsSideActiveRef = useRef<HTMLDivElement | null>(null);
 
@@ -275,6 +282,43 @@ export default function App() {
     const timer = setTimeout(() => setToast(null), 5000);
     return () => clearTimeout(timer);
   }, [toast]);
+
+  // Liquid Glass dynamic pointer-driven optical light angle & caustic sheen
+  useEffect(() => {
+    const el = appShellRef.current;
+    if (!el || glassMode !== "acrylic") return;
+    let rafId = 0;
+    let latestX = window.innerWidth * 0.35;
+    let latestY = window.innerHeight * 0.25;
+
+    const applyLight = () => {
+      rafId = 0;
+      const w = el.clientWidth || window.innerWidth || 1;
+      const h = el.clientHeight || window.innerHeight || 1;
+      const px = Math.max(0, Math.min(100, (latestX / w) * 100));
+      const py = Math.max(0, Math.min(100, (latestY / h) * 100));
+      const angle = Math.round(
+        Math.atan2(latestY - h * 0.5, latestX - w * 0.5) * (180 / Math.PI) + 135
+      );
+      el.style.setProperty("--px", `${px.toFixed(1)}%`);
+      el.style.setProperty("--py", `${py.toFixed(1)}%`);
+      el.style.setProperty("--light-angle", `${angle}deg`);
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      latestX = e.clientX;
+      latestY = e.clientY;
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyLight);
+      }
+    };
+
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [glassMode]);
 
   // Dynamic Acrylic Accent Extraction from Album Art
   useEffect(() => {
@@ -1784,7 +1828,13 @@ export default function App() {
   });
 
   return (
-    <div className="app-shell" data-glass={glassMode}>
+    <div
+      ref={appShellRef}
+      className="app-shell"
+      data-glass={glassMode}
+      data-refract={glassMode === "acrylic" && svgRefractSupported ? "svg" : "css"}
+    >
+      {glassMode === "acrylic" && svgRefractSupported && <LiquidGlassFilters />}
       {showSplash && <StartupSplash onFinish={() => setShowSplash(false)} />}
 
       <div className="aurora-mesh" />
@@ -1814,113 +1864,115 @@ export default function App() {
       <div className={`main-workspace ${sidePanelOpen ? "" : "panel-collapsed"}`}>
         {/* Left Navigation Sidebar */}
         <aside className="sidebar">
-          <div className="brand-header">
-            <div className="brand-logo">
-              <Disc3 size={20} color="#fff" className={isPlaying ? "spin" : ""} />
-            </div>
-            <div className="brand-title-group">
-              <div className="brand-name truncate">AetherMusic</div>
-              <div className="brand-sub truncate">Hi-Res · AI DJ · Cross-Platform</div>
-            </div>
-          </div>
-
-          <nav className="nav-section">
-            <div className="nav-section-label">探索與混音</div>
-            <button
-              type="button"
-              className={`nav-item ${navTab === "home" ? "active" : ""}`}
-              onClick={() => setNavTab("home")}
-            >
-              <Home size={17} />
-              <span className="truncate">探索首頁</span>
-            </button>
-            <button
-              type="button"
-              className={`nav-item ${navTab === "search" ? "active" : ""}`}
-              onClick={() => setNavTab("search")}
-            >
-              <Search size={17} />
-              <span className="truncate">搜尋音樂</span>
-            </button>
-            <button
-              type="button"
-              className={`nav-item ${navTab === "dj" ? "active" : ""}`}
-              onClick={() => setNavTab("dj")}
-            >
-              <Radio size={17} />
-              <span className="truncate">AI DJ Mix</span>
-              <span className={`nav-badge ${djEnabled ? "dj" : ""}`}>
-                {djEnabled ? "LIVE" : "DJ"}
-              </span>
-            </button>
-            <button
-              type="button"
-              className={`nav-item ${navTab === "lyrics" ? "active" : ""}`}
-              onClick={() => setNavTab("lyrics")}
-            >
-              <Mic2 size={17} />
-              <span className="truncate">動態歌詞</span>
-              {lyrics?.hasSynced && <span className="nav-badge">SYNC</span>}
-            </button>
-          </nav>
-
-          <nav className="nav-section">
-            <div className="nav-section-label">媒體與系統</div>
-            <button
-              type="button"
-              className={`nav-item ${navTab === "queue" ? "active" : ""}`}
-              onClick={() => setNavTab("queue")}
-            >
-              <ListMusic size={17} />
-              <span className="truncate">播放佇列</span>
-              <span className="nav-badge tabular-nums">{queue.length}</span>
-            </button>
-            <button
-              type="button"
-              className={`nav-item ${navTab === "library" ? "active" : ""}`}
-              onClick={() => setNavTab("library")}
-            >
-              <Library size={17} />
-              <span className="truncate">收藏與紀錄</span>
-              <span className="nav-badge tabular-nums">{favorites.length}</span>
-            </button>
-            <button
-              type="button"
-              className={`nav-item ${navTab === "settings" ? "active" : ""}`}
-              onClick={() => setNavTab("settings")}
-            >
-              <Settings size={17} />
-              <span className="truncate">音質・更新・授權</span>
-              {(updateStatus?.appUpdateAvailable || updateStatus?.ytdlpUpdateAvailable) && (
-                <span className="nav-badge dj">NEW</span>
-              )}
-            </button>
-          </nav>
-
-          <div className="sidebar-footer">
-            <div className="status-row">
-              <div className="status-dot-wrap">
-                <span className={`status-dot ${engineStatus?.ytmapiReady !== false ? "ok" : "warn"}`} />
-                <span className="truncate">YTMAPI / InnerTube</span>
+          <div className="sidebar-scroll">
+            <div className="brand-header">
+              <div className="brand-logo">
+                <Disc3 size={20} color="#fff" className={isPlaying ? "spin" : ""} />
               </div>
-              <span style={{ color: "#10b981", fontWeight: 600 }}>就緒</span>
+              <div className="brand-title-group">
+                <div className="brand-name truncate">AetherMusic</div>
+                <div className="brand-sub truncate">Hi-Res · AI DJ · Cross-Platform</div>
+              </div>
             </div>
-            <div className="status-row">
-              <div className="status-dot-wrap">
-                <span className="status-dot ok" />
-                <span className="truncate">
-                  {engineStatus?.ytdlpAvailable ? "yt-dlp 串流" : "純 Rust 串流"}
+
+            <nav className="nav-section">
+              <div className="nav-section-label">探索與混音</div>
+              <button
+                type="button"
+                className={`nav-item ${navTab === "home" ? "active" : ""}`}
+                onClick={() => setNavTab("home")}
+              >
+                <Home size={17} />
+                <span className="truncate">探索首頁</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-item ${navTab === "search" ? "active" : ""}`}
+                onClick={() => setNavTab("search")}
+              >
+                <Search size={17} />
+                <span className="truncate">搜尋音樂</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-item ${navTab === "dj" ? "active" : ""}`}
+                onClick={() => setNavTab("dj")}
+              >
+                <Radio size={17} />
+                <span className="truncate">AI DJ Mix</span>
+                <span className={`nav-badge ${djEnabled ? "dj" : ""}`}>
+                  {djEnabled ? "LIVE" : "DJ"}
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`nav-item ${navTab === "lyrics" ? "active" : ""}`}
+                onClick={() => setNavTab("lyrics")}
+              >
+                <Mic2 size={17} />
+                <span className="truncate">動態歌詞</span>
+                {lyrics?.hasSynced && <span className="nav-badge">SYNC</span>}
+              </button>
+            </nav>
+
+            <nav className="nav-section">
+              <div className="nav-section-label">媒體與系統</div>
+              <button
+                type="button"
+                className={`nav-item ${navTab === "queue" ? "active" : ""}`}
+                onClick={() => setNavTab("queue")}
+              >
+                <ListMusic size={17} />
+                <span className="truncate">播放佇列</span>
+                <span className="nav-badge tabular-nums">{queue.length}</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-item ${navTab === "library" ? "active" : ""}`}
+                onClick={() => setNavTab("library")}
+              >
+                <Library size={17} />
+                <span className="truncate">收藏與紀錄</span>
+                <span className="nav-badge tabular-nums">{favorites.length}</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-item ${navTab === "settings" ? "active" : ""}`}
+                onClick={() => setNavTab("settings")}
+              >
+                <Settings size={17} />
+                <span className="truncate">音質・更新・授權</span>
+                {(updateStatus?.appUpdateAvailable || updateStatus?.ytdlpUpdateAvailable) && (
+                  <span className="nav-badge dj">NEW</span>
+                )}
+              </button>
+            </nav>
+
+            <div className="sidebar-footer">
+              <div className="status-row">
+                <div className="status-dot-wrap">
+                  <span className={`status-dot ${engineStatus?.ytmapiReady !== false ? "ok" : "warn"}`} />
+                  <span className="truncate">YTMAPI / InnerTube</span>
+                </div>
+                <span style={{ color: "#10b981", fontWeight: 600 }}>就緒</span>
+              </div>
+              <div className="status-row">
+                <div className="status-dot-wrap">
+                  <span className="status-dot ok" />
+                  <span className="truncate">
+                    {engineStatus?.ytdlpAvailable ? "yt-dlp 串流" : "純 Rust 串流"}
+                  </span>
+                </div>
+                <span className="truncate" style={{ maxWidth: 74, color: "var(--text-secondary)" }}>
+                  {engineStatus?.ytdlpAvailable ? engineStatus.ytdlpVersion : engineStatus?.platform || "active"}
                 </span>
               </div>
-              <span className="truncate" style={{ maxWidth: 74, color: "var(--text-secondary)" }}>
-                {engineStatus?.ytdlpAvailable ? engineStatus.ytdlpVersion : engineStatus?.platform || "active"}
-              </span>
-            </div>
-            <div className="status-row" style={{ fontSize: 10.5, color: "var(--text-muted)" }}>
-              <span>GPL-3.0 · Deck {activeDeck}</span>
-              <span className="tabular-nums">
-                {engineStatus?.proxyPort ? `:${engineStatus.proxyPort}` : ""}
-              </span>
+              <div className="status-row" style={{ fontSize: 10.5, color: "var(--text-muted)" }}>
+                <span>GPL-3.0 · Deck {activeDeck}</span>
+                <span className="tabular-nums">
+                  {engineStatus?.proxyPort ? `:${engineStatus.proxyPort}` : ""}
+                </span>
+              </div>
             </div>
           </div>
         </aside>
@@ -1987,9 +2039,9 @@ export default function App() {
                 type="button"
                 className={`icon-pill-btn ${glassMode === "acrylic" ? "active" : ""}`}
                 onClick={() => setGlassMode((m) => (m === "acrylic" ? "lite" : "acrylic"))}
-                title="切換絢麗毛玻璃 / 極致省電模式"
+                title="切換光學折射 Liquid Glass / 極致省電模式"
               >
-                <span>{glassMode === "acrylic" ? "毛玻璃: 絢麗" : "毛玻璃: 省電"}</span>
+                <span>{glassMode === "acrylic" ? "液態玻璃" : "極致省電"}</span>
               </button>
               <button
                 type="button"
@@ -2019,7 +2071,7 @@ export default function App() {
                   <div style={{ minWidth: 0 }}>
                     <div className="hero-eyebrow">
                       <Compass size={14} />
-                      <span>HI-RES 無損 DSP × SPOTIFY AI DJ MIX × 低耗能毛玻璃</span>
+                      <span>HI-RES 無損 DSP × SPOTIFY AI DJ MIX × 光學折射 LIQUID GLASS</span>
                     </div>
                     <h1 className="hero-title truncate">
                       {currentTrack ? `正在聆聽：${currentTrack.title}` : "探索無界雲端音樂"}
@@ -2586,7 +2638,7 @@ export default function App() {
                   </div>
 
                   <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 4 }}>
-                    低耗能毛玻璃模式：
+                    光學液態玻璃模式：
                   </div>
                   <div className="chip-row">
                     <button
@@ -2594,7 +2646,7 @@ export default function App() {
                       className={`chip-btn ${glassMode === "acrylic" ? "active" : ""}`}
                       onClick={() => setGlassMode("acrylic")}
                     >
-                      絢麗毛玻璃 (Acrylic + 封面動態取色)
+                      液態玻璃 (Liquid Glass · 光學折射與色散)
                     </button>
                     <button
                       type="button"
