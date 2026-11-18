@@ -60,8 +60,8 @@ export const DJ_VIBES: DjVibeOption[] = [
 ];
 
 export const EQ_PRESETS: Record<EqPreset, { label: string; low: number; mid: number; high: number }> = {
-  hires: { label: "Hi-Res 無損母帶", low: 1.5, mid: 0.5, high: 2.5 },
-  flat: { label: "原音無渲染", low: 0, mid: 0, high: 0 },
+  flat: { label: "Pure Direct 原音直通", low: 0, mid: 0, high: 0 },
+  hires: { label: "微調解析空氣感", low: 1.0, mid: 0, high: 1.5 },
   bass: { label: "深沉重低音", low: 6, mid: -1, high: 1.5 },
   club: { label: "DJ Club 現場", low: 5, mid: -2, high: 4 },
   vocal: { label: "清晰人聲", low: -2, mid: 4.5, high: 2 },

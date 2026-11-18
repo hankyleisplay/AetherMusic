@@ -276,16 +276,16 @@ fn build_quality_metadata(quality: &str, acodec: &str, sample_rate: &str) -> (St
     if lower_codec.contains("flac") || lower_codec.contains("alac") || lower_codec.contains("pcm") {
         return (
             "24-bit Lossless".to_string(),
-            format!("Native Lossless · {sample_rate}"),
+            format!("真無損母帶 · {sample_rate}"),
         );
     }
     match quality {
         "lossless" => (
-            "32-bit Float Hi-Res DSP".to_string(),
-            format!("Hi-Res Master DSP · {sample_rate}"),
+            "Pure Direct 32-bit Float".to_string(),
+            format!("最高雲端音質 · {sample_rate}"),
         ),
         "standard" => ("16-bit Standard".to_string(), format!("標準省流 · {sample_rate}")),
-        _ => ("24-bit Float DSP".to_string(), format!("高解析串流 · {sample_rate}")),
+        _ => ("Pure Direct 24-bit".to_string(), format!("高解析串流 · {sample_rate}")),
     }
 }
 
@@ -402,9 +402,16 @@ pub async fn extract_stream_innertube(
                 cap_bonus + bitrate
             }
             "lossless" => {
-                let opus_bonus = if mime.contains("opus") { 500_000 } else { 0 };
-                let sr_bonus = if asr >= 48000 { 300_000 } else { 0 };
-                opus_bonus + sr_bonus + bitrate
+                let tier_bonus = if bitrate >= 220_000 {
+                    2_000_000
+                } else if bitrate >= 140_000 {
+                    1_000_000
+                } else {
+                    0
+                };
+                let sr_bonus = if asr >= 48000 { 250_000 } else { 0 };
+                let opus_bonus = if mime.contains("opus") { 100_000 } else { 0 };
+                tier_bonus + sr_bonus + opus_bonus + bitrate
             }
             _ => {
                 let m4a_bonus = if mime.contains("mp4a") { 200_000 } else { 0 };
@@ -480,9 +487,13 @@ async fn extract_stream_ytdlp(
         "--no-check-certificates",
         "-f",
         format_selector,
-        "--print",
-        "%(acodec)s|%(abr)s|%(asr)s|%(ext)s|%(url)s",
     ];
+    if quality == "lossless" {
+        args.push("-S");
+        args.push("hasaud,abr,asr,acodec:flac:opus:aac");
+    }
+    args.push("--print");
+    args.push("%(acodec)s|%(abr,tbr)s|%(asr)s|%(ext)s|%(url)s");
     if has_node_runtime().await {
         args.push("--js-runtimes");
         args.push("node");

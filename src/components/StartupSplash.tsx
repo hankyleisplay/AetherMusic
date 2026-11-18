@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Disc3, Radio, Sparkles, Waves } from "lucide-react";
+import { Radio, Sparkles, Waves } from "lucide-react";
+import appIconUrl from "../assets/app-icon.png";
 
 interface StartupSplashProps {
   onFinish: () => void;
@@ -8,7 +9,7 @@ interface StartupSplashProps {
 const BOOT_STEPS = [
   "啟動本地 HTTP Range 音訊代理...",
   "連線 YTMAPI 與跨平臺串流核心...",
-  "載入 32-bit Float 無損 DSP 與 AI DJ Mix...",
+  "載入 Pure Direct 無壓縮音訊引擎與 AI DJ Mix...",
 ];
 
 export function StartupSplash({ onFinish }: StartupSplashProps) {
@@ -41,15 +42,13 @@ export function StartupSplash({ onFinish }: StartupSplashProps) {
       <div className="splash-aurora" />
       <div className="splash-core">
         <div className="splash-orbit-ring">
-          <div className="splash-logo-disc">
-            <Disc3 size={38} color="#fff" />
-          </div>
+          <img src={appIconUrl} alt="AetherMusic" className="splash-logo-img" />
         </div>
 
         <div className="splash-brand">AetherMusic</div>
         <div className="splash-tagline">
           <Sparkles size={13} />
-          <span>Hi-Res Lossless DSP · AI DJ Mix · Cross-Platform</span>
+          <span>Pure Direct Audio · AI DJ Mix · Cross-Platform</span>
         </div>
 
         <div className="splash-progress-track">

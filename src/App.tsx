@@ -5,6 +5,7 @@ import {
   Compass,
   Disc3,
   Download,
+  FolderPlus,
   HardDrive,
   Heart,
   Home,
@@ -57,12 +58,9 @@ import {
   triggerAudioCache,
   updateMediaSession,
 } from "./api";
+import appIconUrl from "./assets/app-icon.png";
 import { AlbumArt } from "./components/AlbumArt";
 import { DJ_VIBES, DjMixConsole, type DjVibeOption } from "./components/DjMixConsole";
-import {
-  LiquidGlassFilters,
-  supportsBackdropSvgRefraction,
-} from "./components/LiquidGlassFilters";
 import { SpectrumCanvas } from "./components/SpectrumCanvas";
 import { StartupSplash } from "./components/StartupSplash";
 import { TrackTable } from "./components/TrackTable";
@@ -161,7 +159,7 @@ export default function App() {
         crossfadeSec: 5,
         djVoiceEnabled: true,
         djVibe: "club" as DjVibeId,
-        eq: { low: 1.5, mid: 0.5, high: 2.5, preset: "hires" } as EqSettings,
+        eq: { low: 0, mid: 0, high: 0, preset: "flat" } as EqSettings,
         closeToTray: true,
       }),
     []
@@ -183,6 +181,9 @@ export default function App() {
   const [shuffle, setShuffle] = useState<boolean>(initialSettings.shuffle);
   const [audioQuality, setAudioQuality] = useState<AudioQuality>(initialSettings.audioQuality);
   const [glassMode, setGlassMode] = useState<GlassMode>(initialSettings.glassMode);
+  const [pureDirect, setPureDirect] = useState<boolean>(() =>
+    loadJsonStorage<boolean>("aethermusic_pure_direct_v1", true)
+  );
   const [fetchingRecs, setFetchingRecs] = useState(false);
 
   // AI DJ Mix state
@@ -212,12 +213,13 @@ export default function App() {
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(() => new Set());
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
+  const [detectingEngine, setDetectingEngine] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updatingCore, setUpdatingCore] = useState(false);
   const [toast, setToast] = useState<{ message: string; isError?: boolean } | null>(null);
 
-  // Dual-deck Audio & 32-bit Float DSP Web Audio refs
+  // Dual-deck Audio & Pure Direct Web Audio refs
   const audioARef = useRef<HTMLAudioElement | null>(null);
   const audioBRef = useRef<HTMLAudioElement | null>(null);
   const activeDeckRef = useRef<"A" | "B">("A");
@@ -229,6 +231,8 @@ export default function App() {
   const lowFilterRef = useRef<BiquadFilterNode | null>(null);
   const midFilterRef = useRef<BiquadFilterNode | null>(null);
   const highFilterRef = useRef<BiquadFilterNode | null>(null);
+  const pureDirectGainRef = useRef<GainNode | null>(null);
+  const limiterGainRef = useRef<GainNode | null>(null);
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
 
   // Mutable refs for async/event accuracy
@@ -251,9 +255,6 @@ export default function App() {
   const crossfadeCleanupTimerRef = useRef<number | null>(null);
   const playedIdsRef = useRef<Set<string>>(new Set());
   const recInFlightRef = useRef<boolean>(false);
-
-  const appShellRef = useRef<HTMLDivElement | null>(null);
-  const svgRefractSupported = useMemo(() => supportsBackdropSvgRefraction(), []);
 
   const lyricsMainActiveRef = useRef<HTMLButtonElement | null>(null);
   const lyricsSideActiveRef = useRef<HTMLDivElement | null>(null);
@@ -283,42 +284,13 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [toast]);
 
-  // Liquid Glass dynamic pointer-driven optical light angle & caustic sheen
   useEffect(() => {
-    const el = appShellRef.current;
-    if (!el || glassMode !== "acrylic") return;
-    let rafId = 0;
-    let latestX = window.innerWidth * 0.35;
-    let latestY = window.innerHeight * 0.25;
-
-    const applyLight = () => {
-      rafId = 0;
-      const w = el.clientWidth || window.innerWidth || 1;
-      const h = el.clientHeight || window.innerHeight || 1;
-      const px = Math.max(0, Math.min(100, (latestX / w) * 100));
-      const py = Math.max(0, Math.min(100, (latestY / h) * 100));
-      const angle = Math.round(
-        Math.atan2(latestY - h * 0.5, latestX - w * 0.5) * (180 / Math.PI) + 135
-      );
-      el.style.setProperty("--px", `${px.toFixed(1)}%`);
-      el.style.setProperty("--py", `${py.toFixed(1)}%`);
-      el.style.setProperty("--light-angle", `${angle}deg`);
-    };
-
-    const onPointerMove = (e: PointerEvent) => {
-      latestX = e.clientX;
-      latestY = e.clientY;
-      if (!rafId) {
-        rafId = requestAnimationFrame(applyLight);
-      }
-    };
-
-    window.addEventListener("pointermove", onPointerMove, { passive: true });
-    return () => {
-      window.removeEventListener("pointermove", onPointerMove);
-      if (rafId) cancelAnimationFrame(rafId);
-    };
-  }, [glassMode]);
+    try {
+      localStorage.setItem("aethermusic_pure_direct_v1", JSON.stringify(pureDirect));
+    } catch {
+      // ignore
+    }
+  }, [pureDirect]);
 
   // Dynamic Acrylic Accent Extraction from Album Art
   useEffect(() => {
@@ -466,6 +438,15 @@ export default function App() {
     if (highFilterRef.current) highFilterRef.current.gain.setTargetAtTime(eq.high, now, 0.04);
   }, [eq]);
 
+  // Switch cleanly between Pure Direct (uncompressed) and Limiter protection
+  useEffect(() => {
+    const ctx = audioCtxRef.current;
+    if (!ctx || !pureDirectGainRef.current || !limiterGainRef.current) return;
+    const now = ctx.currentTime;
+    pureDirectGainRef.current.gain.setTargetAtTime(pureDirect ? 1 : 0, now, 0.02);
+    limiterGainRef.current.gain.setTargetAtTime(pureDirect ? 0 : 1, now, 0.02);
+  }, [pureDirect]);
+
   const getActiveAudio = useCallback(() => {
     return activeDeckRef.current === "A" ? audioARef.current : audioBRef.current;
   }, []);
@@ -505,11 +486,16 @@ export default function App() {
         high.gain.value = eq.high;
 
         const limiter = ctx.createDynamicsCompressor();
-        limiter.threshold.value = -1.5;
-        limiter.knee.value = 6;
-        limiter.ratio.value = 4;
-        limiter.attack.value = 0.003;
-        limiter.release.value = 0.15;
+        limiter.threshold.value = -0.5;
+        limiter.knee.value = 2;
+        limiter.ratio.value = 8;
+        limiter.attack.value = 0.002;
+        limiter.release.value = 0.12;
+
+        const pureDirectGain = ctx.createGain();
+        const limiterGain = ctx.createGain();
+        pureDirectGain.gain.value = pureDirect ? 1 : 0;
+        limiterGain.gain.value = pureDirect ? 0 : 1;
 
         const analyserNode = ctx.createAnalyser();
         analyserNode.fftSize = 128;
@@ -530,8 +516,16 @@ export default function App() {
 
         low.connect(mid);
         mid.connect(high);
+
+        // Pure Direct branch: zero dynamic compression / zero lookahead latency
+        high.connect(pureDirectGain);
+        pureDirectGain.connect(analyserNode);
+
+        // Optional anti-clipping limiter branch (for heavy EQ boost)
         high.connect(limiter);
-        limiter.connect(analyserNode);
+        limiter.connect(limiterGain);
+        limiterGain.connect(analyserNode);
+
         analyserNode.connect(ctx.destination);
 
         audioCtxRef.current = ctx;
@@ -540,6 +534,8 @@ export default function App() {
         lowFilterRef.current = low;
         midFilterRef.current = mid;
         highFilterRef.current = high;
+        pureDirectGainRef.current = pureDirectGain;
+        limiterGainRef.current = limiterGain;
         setAnalyser(analyserNode);
       }
 
@@ -549,7 +545,7 @@ export default function App() {
     } catch {
       // Fallback safely if Web Audio creation isn't supported
     }
-  }, [eq.high, eq.low, eq.mid]);
+  }, [eq.high, eq.low, eq.mid, pureDirect]);
 
   const speakDjTransition = useCallback((track: Track, vibeLabel?: string) => {
     const script = vibeLabel
@@ -573,20 +569,39 @@ export default function App() {
     }
   }, []);
 
-  const refreshEngineStatus = useCallback(async () => {
-    try {
-      const status = await getEngineStatus();
-      setEngineStatus(status);
-    } catch {
-      // ignore outside Tauri
-    }
-    try {
-      const cs = await getCacheStats();
-      setCacheStats(cs);
-    } catch {
-      // ignore
-    }
-  }, []);
+  const refreshEngineStatus = useCallback(
+    async (forceRedetect = false, showFeedback = false) => {
+      if (forceRedetect) {
+        setDetectingEngine(true);
+      }
+      try {
+        const status = await getEngineStatus(forceRedetect);
+        setEngineStatus(status);
+        if (showFeedback) {
+          const ytdlpLabel = status.ytdlpAvailable
+            ? `yt-dlp ${status.ytdlpVersion}`
+            : "純 Rust InnerTube 備援";
+          const proxyLabel = status.proxyPort ? `127.0.0.1:${status.proxyPort}` : "未啟動";
+          showToast(`引擎偵測完成：${ytdlpLabel} · Proxy ${proxyLabel}`);
+        }
+      } catch (err) {
+        if (showFeedback) {
+          showToast(`引擎偵測失敗（目前可能非 Tauri 執行環境）: ${String(err)}`, true);
+        }
+      } finally {
+        if (forceRedetect) {
+          setDetectingEngine(false);
+        }
+      }
+      try {
+        const cs = await getCacheStats();
+        setCacheStats(cs);
+      } catch {
+        // ignore
+      }
+    },
+    [showToast]
+  );
 
   const handleCheckUpdates = useCallback(
     async (silent = false) => {
@@ -1828,13 +1843,7 @@ export default function App() {
   });
 
   return (
-    <div
-      ref={appShellRef}
-      className="app-shell"
-      data-glass={glassMode}
-      data-refract={glassMode === "acrylic" && svgRefractSupported ? "svg" : "css"}
-    >
-      {glassMode === "acrylic" && svgRefractSupported && <LiquidGlassFilters />}
+    <div className="app-shell" data-glass={glassMode}>
       {showSplash && <StartupSplash onFinish={() => setShowSplash(false)} />}
 
       <div className="aurora-mesh" />
@@ -1867,11 +1876,11 @@ export default function App() {
           <div className="sidebar-scroll">
             <div className="brand-header">
               <div className="brand-logo">
-                <Disc3 size={20} color="#fff" className={isPlaying ? "spin" : ""} />
+                <img src={appIconUrl} alt="AetherMusic" className="brand-logo-img" />
               </div>
               <div className="brand-title-group">
                 <div className="brand-name truncate">AetherMusic</div>
-                <div className="brand-sub truncate">Hi-Res · AI DJ · Cross-Platform</div>
+                <div className="brand-sub truncate">Pure Direct · AI DJ · Cross-Platform</div>
               </div>
             </div>
 
@@ -2018,20 +2027,20 @@ export default function App() {
                   setAudioQuality(next);
                   showToast(
                     next === "lossless"
-                      ? "已切換為 Hi-Res 無損母帶 DSP 模式"
+                      ? "已切換為最高音質串流 (Pure Direct)"
                       : next === "high"
-                        ? "已切換為極高音質模式"
+                        ? "已切換為極高音質模式 (AAC/M4A)"
                         : "已切換為標準省流模式"
                   );
                 }}
-                title="切換音質檔位 (Hi-Res 無損 / 極高 / 標準)"
+                title="切換音質檔位 (最高音質 / 極高 / 標準)"
               >
                 <Sparkles size={13} />
                 <span>
                   {audioQuality === "lossless"
-                    ? "Hi-Res 無損"
+                    ? "最高音質"
                     : audioQuality === "high"
-                      ? "極高音質"
+                      ? "高音質"
                       : "標準省流"}
                 </span>
               </button>
@@ -2039,9 +2048,9 @@ export default function App() {
                 type="button"
                 className={`icon-pill-btn ${glassMode === "acrylic" ? "active" : ""}`}
                 onClick={() => setGlassMode((m) => (m === "acrylic" ? "lite" : "acrylic"))}
-                title="切換光學折射 Liquid Glass / 極致省電模式"
+                title="切換質感深色霧面 / 純淨極簡深黑"
               >
-                <span>{glassMode === "acrylic" ? "液態玻璃" : "極致省電"}</span>
+                <span>{glassMode === "acrylic" ? "深色霧面" : "純淨深黑"}</span>
               </button>
               <button
                 type="button"
@@ -2071,7 +2080,7 @@ export default function App() {
                   <div style={{ minWidth: 0 }}>
                     <div className="hero-eyebrow">
                       <Compass size={14} />
-                      <span>HI-RES 無損 DSP × SPOTIFY AI DJ MIX × 光學折射 LIQUID GLASS</span>
+                      <span>PURE DIRECT 無壓縮直通 × SPOTIFY AI DJ MIX × 本機無損母帶</span>
                     </div>
                     <h1 className="hero-title truncate">
                       {currentTrack ? `正在聆聽：${currentTrack.title}` : "探索無界雲端音樂"}
@@ -2606,23 +2615,23 @@ export default function App() {
               </div>
             )}
 
-            {/* SETTINGS, LOSS-LESS AUDIO, AUTO-UPDATER & CROSS-PLATFORM VIEW */}
+            {/* SETTINGS, AUDIO QUALITY, AUTO-UPDATER & CROSS-PLATFORM VIEW */}
             {navTab === "settings" && (
               <div className="settings-grid">
                 <div className="panel-card">
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <h3 style={{ margin: 0, fontSize: 16 }}>音質・毛玻璃特效設定</h3>
+                    <h3 style={{ margin: 0, fontSize: 16 }}>音質引擎與介面外觀設定</h3>
                     <span className="quality-badge">
                       {engineStatus ? `${engineStatus.platform} / ${engineStatus.arch}` : "Cross-Platform"}
                     </span>
                   </div>
 
-                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>串流音質與 DSP 引擎：</div>
+                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>串流音質來源優先順序：</div>
                   <div className="chip-row">
                     {(
                       [
-                        ["lossless", "Hi-Res 無損母帶 (48kHz + 32-bit DSP)"],
-                        ["high", "極高音質 (AAC/M4A)"],
+                        ["lossless", "最高音質 (48kHz Opus / 最高位元率)"],
+                        ["high", "高音質 (AAC/M4A)"],
                         ["standard", "標準省流"],
                       ] as const
                     ).map(([q, lbl]) => (
@@ -2637,8 +2646,55 @@ export default function App() {
                     ))}
                   </div>
 
+                  <div className="auto-radio-card" style={{ marginTop: 2 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                        Pure Direct 無壓縮原音直通
+                      </div>
+                      <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 2 }}>
+                        繞過動態壓縮限幅器，保留完整瞬態動態與音場細節（建議開啟）
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`toggle-switch ${pureDirect ? "on" : ""}`}
+                      onClick={() => {
+                        const next = !pureDirect;
+                        setPureDirect(next);
+                        showToast(
+                          next
+                            ? "已啟用 Pure Direct 無壓縮原音直通"
+                            : "已啟用防破音安全限幅器 (Limiter)"
+                        );
+                      }}
+                      aria-label="切換 Pure Direct 無壓縮原音直通"
+                    >
+                      <span className="toggle-knob" />
+                    </button>
+                  </div>
+
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <span style={{ fontSize: 11.5, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                      註：YouTube Music 雲端串流上限為 ~160–256 kbps Opus/AAC；匯入本機 FLAC / WAV 可享真無損播放。
+                    </span>
+                    <label
+                      className="secondary-btn"
+                      style={{ padding: "6px 11px", fontSize: 12, flexShrink: 0, cursor: "pointer" }}
+                    >
+                      <FolderPlus size={13} />
+                      <span>匯入無損音檔</span>
+                      <input
+                        type="file"
+                        accept=".flac,.wav,.alac,.aiff,.m4a,.mp3,.ogg,.opus"
+                        multiple
+                        style={{ display: "none" }}
+                        onChange={(e) => handleImportLocalLossless(e.target.files)}
+                      />
+                    </label>
+                  </div>
+
                   <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 4 }}>
-                    光學液態玻璃模式：
+                    介面外觀風格：
                   </div>
                   <div className="chip-row">
                     <button
@@ -2646,14 +2702,14 @@ export default function App() {
                       className={`chip-btn ${glassMode === "acrylic" ? "active" : ""}`}
                       onClick={() => setGlassMode("acrylic")}
                     >
-                      液態玻璃 (Liquid Glass · 光學折射與色散)
+                      質感深色霧面 (高對比護眼)
                     </button>
                     <button
                       type="button"
                       className={`chip-btn ${glassMode === "lite" ? "active" : ""}`}
                       onClick={() => setGlassMode("lite")}
                     >
-                      極致省電 (Lite)
+                      純淨極簡深黑 (Solid)
                     </button>
                   </div>
 
@@ -2666,9 +2722,9 @@ export default function App() {
                         </span>
                       </div>
                       <div className="info-kv">
-                        <span className="info-k">位元深度 / 引擎</span>
+                        <span className="info-k">處理路徑 / 引擎</span>
                         <span className="info-v">
-                          {streamInfo.bitDepth} · {streamInfo.engineUsed}
+                          {pureDirect ? "Pure Direct 直通" : "EQ Limiter"} · {streamInfo.engineUsed}
                         </span>
                       </div>
                     </>
@@ -2770,7 +2826,7 @@ export default function App() {
                   <div className="info-kv">
                     <span className="info-k">AetherMusic 目前版本</span>
                     <span className="info-v tabular-nums">
-                      v{updateStatus?.currentAppVersion || "0.2.0"}
+                      v{updateStatus?.currentAppVersion || "0.2.1"}
                     </span>
                   </div>
                   <div className="info-kv">
@@ -2816,7 +2872,7 @@ export default function App() {
 
                 {/* Engine Status & GPL-3.0 */}
                 <div className="panel-card">
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <ShieldCheck size={18} style={{ color: "var(--accent-secondary)" }} />
                       <h3 style={{ margin: 0, fontSize: 16 }}>跨平臺引擎與 GPL-3.0 授權</h3>
@@ -2824,11 +2880,12 @@ export default function App() {
                     <button
                       type="button"
                       className="secondary-btn"
-                      style={{ padding: "6px 11px", fontSize: 12 }}
-                      onClick={() => void refreshEngineStatus()}
+                      style={{ padding: "6px 11px", fontSize: 12, flexShrink: 0 }}
+                      onClick={() => void refreshEngineStatus(true, true)}
+                      disabled={detectingEngine}
                     >
-                      <RefreshCw size={13} />
-                      重新偵測
+                      <RefreshCw size={13} className={detectingEngine ? "spin" : ""} />
+                      {detectingEngine ? "偵測中..." : "重新偵測"}
                     </button>
                   </div>
                   <div className="info-kv">
@@ -3175,7 +3232,12 @@ export default function App() {
                   </span>
                   {streamInfo && (
                     <span className="quality-badge">
-                      {audioQuality === "lossless" ? "Hi-Res" : streamInfo.abr}
+                      {streamInfo.engineUsed === "local-file" ||
+                      streamInfo.acodec.toLowerCase().includes("flac")
+                        ? "無損"
+                        : pureDirect
+                          ? `Direct · ${streamInfo.abr}`
+                          : streamInfo.abr}
                     </span>
                   )}
                 </div>
@@ -3210,7 +3272,7 @@ export default function App() {
           ) : (
             <div className="player-track-meta">
               <div className="player-title truncate">AetherMusic 已就緒</div>
-              <div className="player-artist truncate">Hi-Res 無損串流 · AI DJ Mix</div>
+              <div className="player-artist truncate">Pure Direct 無壓縮音訊 · AI DJ Mix</div>
             </div>
           )}
         </div>

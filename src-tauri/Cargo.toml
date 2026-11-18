@@ -1,6 +1,6 @@
 [package]
 name = "aether-music"
-version = "0.2.0"
+version = "0.2.1"
 description = "AetherMusic - Cloud streaming music player powered by Tauri, Rust, yt-dlp, and YTMAPI"
 authors = ["HANSON <hankyleisplay@gmail.com>"]
 license = "GPL-3.0-only"

@@ -143,10 +143,10 @@ pub struct EqSettings {
 impl Default for EqSettings {
     fn default() -> Self {
         Self {
-            low: 1.5,
-            mid: 0.5,
-            high: 2.5,
-            preset: "hires".to_string(),
+            low: 0.0,
+            mid: 0.0,
+            high: 0.0,
+            preset: "flat".to_string(),
         }
     }
 }

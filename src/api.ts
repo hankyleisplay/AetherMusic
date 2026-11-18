@@ -66,8 +66,8 @@ export async function getHomeDiscovery(): Promise<HomeSection[]> {
   return invoke<HomeSection[]>("get_home_discovery");
 }
 
-export async function getEngineStatus(): Promise<EngineStatus> {
-  return invoke<EngineStatus>("get_engine_status");
+export async function getEngineStatus(forceRedetect = false): Promise<EngineStatus> {
+  return invoke<EngineStatus>("get_engine_status", { forceRedetect });
 }
 
 export async function checkForUpdates(): Promise<UpdateStatus> {

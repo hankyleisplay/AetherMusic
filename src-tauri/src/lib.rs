@@ -90,7 +90,13 @@ async fn get_home_discovery(state: State<'_, AppState>) -> Result<Vec<HomeSectio
 }
 
 #[tauri::command]
-async fn get_engine_status(state: State<'_, AppState>) -> Result<EngineStatus, String> {
+async fn get_engine_status(
+    state: State<'_, AppState>,
+    force_redetect: Option<bool>,
+) -> Result<EngineStatus, String> {
+    if force_redetect.unwrap_or(false) {
+        *state.ytdlp_cmd.write().await = None;
+    }
     let (ytdlp_available, ytdlp_version, ytdlp_path) = ytdlp::get_ytdlp_status(&state).await;
     let proxy_port = *state.proxy_port.read().await;
     Ok(EngineStatus {
