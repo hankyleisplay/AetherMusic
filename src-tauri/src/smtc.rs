@@ -3,31 +3,37 @@ use std::time::Duration;
 use tauri::{AppHandle, State};
 use tokio::sync::mpsc::UnboundedSender;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
     SeekDirection,
 };
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use tauri::Emitter;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub fn init_smtc(
     app_handle: AppHandle,
     window: &tauri::WebviewWindow,
 ) -> Option<UnboundedSender<SmtcCommand>> {
-    let hwnd = match window.hwnd() {
-        Ok(h) => h,
+    #[cfg(target_os = "windows")]
+    let hwnd_opt = match window.hwnd() {
+        Ok(h) => Some(h.0),
         Err(e) => {
             eprintln!("[SMTC] Failed to retrieve window HWND: {e}");
             return None;
         }
     };
+    #[cfg(not(target_os = "windows"))]
+    let hwnd_opt: Option<*mut std::ffi::c_void> = {
+        let _ = window;
+        None
+    };
 
     let config = PlatformConfig {
         display_name: "AetherMusic",
         dbus_name: "aethermusic",
-        hwnd: Some(hwnd.0 as *mut std::ffi::c_void),
+        hwnd: hwnd_opt,
     };
 
     let mut controls = match MediaControls::new(config) {
@@ -159,11 +165,11 @@ pub fn init_smtc(
         })
         .ok()?;
 
-    println!("[SMTC] Windows SystemMediaTransportControls registered cleanly");
+    println!("[MediaControls] Cross-platform OS media controls registered cleanly");
     Some(tx)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub fn init_smtc(
     _app_handle: AppHandle,
     _window: &tauri::WebviewWindow,
@@ -171,6 +177,7 @@ pub fn init_smtc(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn update_media_session(
     state: State<'_, AppState>,

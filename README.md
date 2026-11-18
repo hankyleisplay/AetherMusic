@@ -2,7 +2,7 @@
 
 A cross-platform cloud & Hi-Res music streaming player built with **Tauri v2 + Rust + React + TypeScript** for **Windows, Linux, and Android**.
 
-## Features (v0.2.0)
+## Features (v2026.11.0)
 
 - **Spotify-Style AI DJ Mix**:
   - Dual-deck audio engine (`Deck A` / `Deck B`) with automatic smooth crossfading, bass-swap EQ transition curves, curated mood vibes (`Late Night`, `Focus Flow`, `Cyber Neon`, `Acoustic Warm`, `Energy Boost`), optional AI DJ voice commentary, and a manual 3-band EQ (`Bass 65Hz`, `Mid 2.5kHz`, `Air 12kHz`).

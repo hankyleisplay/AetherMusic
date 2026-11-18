@@ -8,6 +8,7 @@ export interface Track {
   thumbnailUrl: string;
   isAutoRecommended?: boolean;
   localFileUrl?: string;
+  localFilePath?: string | null;
   isLosslessLocal?: boolean;
 }
 
@@ -24,6 +25,40 @@ export interface SongMetadata {
   relatedBrowseId: string | null;
   radioPlaylistId: string | null;
   relatedTracks: Track[];
+}
+
+export interface RelatedEntity {
+  name: string;
+  subtitle: string;
+  thumbnailUrl: string;
+  kind: string;
+  browseId?: string | null;
+}
+
+export interface EntityDetail {
+  kind: string;
+  name: string;
+  subtitle: string;
+  description: string;
+  thumbnailUrl: string;
+  tracks: Track[];
+  albums: RelatedEntity[];
+  relatedArtists: RelatedEntity[];
+}
+
+export interface CustomPlaylist {
+  id: string;
+  name: string;
+  coverUrl?: string | null;
+  createdAtMs: number;
+  tracks: Track[];
+}
+
+export interface ListeningStats {
+  totalListenSeconds: number;
+  monthlyListenSeconds: Record<string, number>;
+  trackPlayCounts: Record<string, number>;
+  artistPlayCounts: Record<string, number>;
 }
 
 export interface LyricLine {
@@ -79,6 +114,8 @@ export interface UpdateStatus {
   ytdlpLatestVersion: string;
   ytdlpUpdateAvailable: boolean;
   lastChecked: string;
+  installerUrl?: string | null;
+  installerName?: string | null;
 }
 
 export interface UpdateActionResult {
@@ -86,6 +123,7 @@ export interface UpdateActionResult {
   message: string;
   updatedYtdlpVersion: string;
   releaseUrl: string;
+  appUpdateLaunched?: boolean;
 }
 
 export interface DownloadResult {
@@ -103,6 +141,8 @@ export interface CacheStats {
   maxBytes: number;
 }
 
+export type VisualizerStyle = "bars" | "wave" | "aurora";
+
 export interface PersistedSettings {
   volume: number;
   autoRadio: boolean;
@@ -115,6 +155,8 @@ export interface PersistedSettings {
   djVibe: DjVibeId;
   eq: EqSettings;
   closeToTray: boolean;
+  loudnessNorm?: boolean;
+  visualizerStyle?: VisualizerStyle;
 }
 
 export interface UserStore {
@@ -124,20 +166,46 @@ export interface UserStore {
   lastIndex: number;
   lastPositionSec: number;
   settings: PersistedSettings;
+  playlists?: CustomPlaylist[];
+  searchHistory?: string[];
+  lyricsOffsets?: Record<string, number>;
+  listeningStats?: ListeningStats;
+  localFolderPath?: string | null;
+  localTracks?: Track[];
 }
 
-export type NavTab = "home" | "search" | "dj" | "lyrics" | "queue" | "library" | "settings";
+export type NavTab =
+  | "home"
+  | "search"
+  | "dj"
+  | "lyrics"
+  | "queue"
+  | "library"
+  | "settings"
+  | "entity";
 export type SidePanelTab = "queue" | "lyrics" | "info";
 export type RepeatMode = "off" | "all" | "one";
-export type SearchFilter = "songs" | "videos" | "all";
+export type SearchFilter = "songs" | "artists" | "albums" | "playlists" | "videos" | "all";
 export type LyricsSourcePreference = "auto" | "lrclib" | "ytmapi" | "ytdlp";
 export type AudioQuality = "lossless" | "high" | "standard";
 export type GlassMode = "acrylic" | "lite";
 export type DjVibeId = "club" | "chill" | "mandopop" | "anime" | "focus";
-export type EqPreset = "hires" | "flat" | "bass" | "club" | "vocal";
+export type EqPreset =
+  | "flat"
+  | "bass"
+  | "vocal"
+  | "pop"
+  | "rock"
+  | "classical"
+  | "club"
+  | "hires"
+  | "custom";
+
 export interface EqSettings {
   low: number;
   mid: number;
   high: number;
   preset: EqPreset;
+  bands?: number[];
+  customBands?: number[];
 }

@@ -97,19 +97,19 @@ pub async fn resolve_base_data_dir(state: &AppState) -> PathBuf {
         return ov;
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(local).join("AetherMusic");
-        }
-    }
-
     if let Some(dir) = state.app_data_dir.read().await.clone() {
         return dir;
     }
 
+    if let Some(cache_dir) = state.app_cache_dir.read().await.clone() {
+        return cache_dir;
+    }
+
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(xdg).join("AetherMusic");
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local).join("AetherMusic");
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home).join(".local").join("share").join("AetherMusic");
@@ -775,7 +775,7 @@ pub fn embed_mp4_metadata(
     Ok(out)
 }
 
-async fn resolve_downloads_dir(state: &AppState) -> PathBuf {
+pub async fn resolve_downloads_dir(state: &AppState) -> PathBuf {
     #[cfg(target_os = "windows")]
     if let Some(profile) = std::env::var_os("USERPROFILE") {
         return PathBuf::from(profile).join("Downloads").join("AetherMusic");
@@ -1020,4 +1020,433 @@ pub async fn download_track_offline(
             has_metadata_tags: true,
         })
     }
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn decode_id3_text_payload(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() {
+        return None;
+    }
+    let encoding = payload[0];
+    let raw = &payload[1..];
+    let text = match encoding {
+        0 => raw.iter().map(|&b| b as char).collect::<String>(),
+        1 | 2 => {
+            let is_le = encoding == 1 && raw.starts_with(&[0xFF, 0xFE]);
+            let data = if encoding == 1 && (raw.starts_with(&[0xFF, 0xFE]) || raw.starts_with(&[0xFE, 0xFF])) {
+                &raw[2..]
+            } else {
+                raw
+            };
+            let u16s: Vec<u16> = data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| {
+                    if is_le {
+                        u16::from_le_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_be_bytes([c[0], c[1]])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&u16s)
+        }
+        3 => String::from_utf8_lossy(raw).to_string(),
+        _ => String::from_utf8_lossy(raw).to_string(),
+    };
+    let cleaned = text.trim_matches('\0').trim().to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn parse_id3v2_metadata(bytes: &[u8]) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    let mut title = None;
+    let mut artist = None;
+    let mut album = None;
+    let mut cover = None;
+
+    if bytes.len() < 10 || &bytes[0..3] != b"ID3" {
+        return (title, artist, album, cover);
+    }
+    let version = bytes[3];
+    let tag_size = (((bytes[6] & 0x7F) as usize) << 21)
+        | (((bytes[7] & 0x7F) as usize) << 14)
+        | (((bytes[8] & 0x7F) as usize) << 7)
+        | ((bytes[9] & 0x7F) as usize);
+    let end = (10 + tag_size).min(bytes.len());
+    let mut off = 10usize;
+    if version < 3 {
+        return (title, artist, album, cover);
+    }
+
+    while off + 10 <= end {
+        let frame_id = &bytes[off..off + 4];
+        if frame_id == [0, 0, 0, 0] {
+            break;
+        }
+        let frame_size = if version == 4 {
+            (((bytes[off + 4] & 0x7F) as usize) << 21)
+                | (((bytes[off + 5] & 0x7F) as usize) << 14)
+                | (((bytes[off + 6] & 0x7F) as usize) << 7)
+                | ((bytes[off + 7] & 0x7F) as usize)
+        } else {
+            u32::from_be_bytes([bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]]) as usize
+        };
+        if frame_size == 0 || off + 10 + frame_size > end {
+            break;
+        }
+        let payload = &bytes[off + 10..off + 10 + frame_size];
+        match frame_id {
+            b"TIT2" => title = title.or_else(|| decode_id3_text_payload(payload)),
+            b"TPE1" => artist = artist.or_else(|| decode_id3_text_payload(payload)),
+            b"TALB" => album = album.or_else(|| decode_id3_text_payload(payload)),
+            b"APIC" if cover.is_none() && payload.len() > 4 => {
+                let enc = payload[0];
+                if let Some(mime_end) = payload[1..].iter().position(|&b| b == 0) {
+                    let mime_raw = String::from_utf8_lossy(&payload[1..1 + mime_end]).to_string();
+                    let after_mime = 1 + mime_end + 1;
+                    if after_mime + 1 < payload.len() {
+                        // skip picture_type (1 byte) + description (null-terminated)
+                        let desc_start = after_mime + 1;
+                        let img_start = if enc == 1 || enc == 2 {
+                            let mut pos = desc_start;
+                            while pos + 1 < payload.len() {
+                                if payload[pos] == 0 && payload[pos + 1] == 0 {
+                                    pos += 2;
+                                    break;
+                                }
+                                pos += 2;
+                            }
+                            pos
+                        } else if let Some(d_end) = payload[desc_start..].iter().position(|&b| b == 0) {
+                            desc_start + d_end + 1
+                        } else {
+                            payload.len()
+                        };
+                        if img_start + 8 < payload.len() && payload.len() - img_start <= 2_000_000 {
+                            let img_bytes = &payload[img_start..];
+                            let mime = if mime_raw.contains("png") || img_bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+                                "image/png"
+                            } else {
+                                "image/jpeg"
+                            };
+                            cover = Some(format!("data:{mime};base64,{}", encode_base64(img_bytes)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        off += 10 + frame_size;
+    }
+
+    (title, artist, album, cover)
+}
+
+fn parse_flac_metadata(bytes: &[u8]) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    let mut title = None;
+    let mut artist = None;
+    let mut album = None;
+    let mut cover = None;
+
+    if bytes.len() < 8 || &bytes[0..4] != b"fLaC" {
+        return (title, artist, album, cover);
+    }
+
+    let mut off = 4usize;
+    while off + 4 <= bytes.len() {
+        let header = bytes[off];
+        let is_last = (header & 0x80) != 0;
+        let block_type = header & 0x7F;
+        let block_len =
+            ((bytes[off + 1] as usize) << 16) | ((bytes[off + 2] as usize) << 8) | (bytes[off + 3] as usize);
+        off += 4;
+        if off + block_len > bytes.len() {
+            break;
+        }
+        let block = &bytes[off..off + block_len];
+
+        if block_type == 4 && block.len() >= 8 {
+            let vendor_len = u32::from_le_bytes([block[0], block[1], block[2], block[3]]) as usize;
+            let mut pos = 4 + vendor_len;
+            if pos + 4 <= block.len() {
+                let count = u32::from_le_bytes([block[pos], block[pos + 1], block[pos + 2], block[pos + 3]]) as usize;
+                pos += 4;
+                for _ in 0..count.min(128) {
+                    if pos + 4 > block.len() {
+                        break;
+                    }
+                    let c_len = u32::from_le_bytes([block[pos], block[pos + 1], block[pos + 2], block[pos + 3]]) as usize;
+                    pos += 4;
+                    if pos + c_len > block.len() {
+                        break;
+                    }
+                    let comment = String::from_utf8_lossy(&block[pos..pos + c_len]);
+                    if let Some((k, v)) = comment.split_once('=') {
+                        let key = k.trim().to_ascii_uppercase();
+                        let val = v.trim().to_string();
+                        if !val.is_empty() {
+                            match key.as_str() {
+                                "TITLE" => title = title.or(Some(val)),
+                                "ARTIST" | "ALBUMARTIST" => artist = artist.or(Some(val)),
+                                "ALBUM" => album = album.or(Some(val)),
+                                _ => {}
+                            }
+                        }
+                    }
+                    pos += c_len;
+                }
+            }
+        } else if block_type == 6 && cover.is_none() && block.len() >= 32 {
+            let mut pos = 4usize;
+            if pos + 4 <= block.len() {
+                let mime_len = u32::from_be_bytes([block[pos], block[pos + 1], block[pos + 2], block[pos + 3]]) as usize;
+                pos += 4;
+                if pos + mime_len + 4 <= block.len() {
+                    let mime_str = String::from_utf8_lossy(&block[pos..pos + mime_len]).to_string();
+                    pos += mime_len;
+                    let desc_len = u32::from_be_bytes([block[pos], block[pos + 1], block[pos + 2], block[pos + 3]]) as usize;
+                    pos += 4 + desc_len + 16;
+                    if pos + 4 <= block.len() {
+                        let pic_len = u32::from_be_bytes([block[pos], block[pos + 1], block[pos + 2], block[pos + 3]]) as usize;
+                        pos += 4;
+                        if pic_len > 8 && pic_len <= 2_000_000 && pos + pic_len <= block.len() {
+                            let mime = if mime_str.contains("png") { "image/png" } else { "image/jpeg" };
+                            cover = Some(format!("data:{mime};base64,{}", encode_base64(&block[pos..pos + pic_len])));
+                        }
+                    }
+                }
+            }
+        }
+
+        off += block_len;
+        if is_last {
+            break;
+        }
+    }
+
+    (title, artist, album, cover)
+}
+
+fn find_mp4_atom_text(haystack: &[u8], atom: &[u8; 4]) -> Option<String> {
+    let pos = haystack.windows(4).position(|w| w == atom)?;
+    if pos + 16 > haystack.len() {
+        return None;
+    }
+    let data_pos = haystack[pos..].windows(4).position(|w| w == b"data")?;
+    let abs = pos + data_pos;
+    if abs < 4 || abs + 12 > haystack.len() {
+        return None;
+    }
+    let data_box_len = u32::from_be_bytes([
+        haystack[abs - 4],
+        haystack[abs - 3],
+        haystack[abs - 2],
+        haystack[abs - 1],
+    ]) as usize;
+    if data_box_len <= 16 || abs - 4 + data_box_len > haystack.len() {
+        return None;
+    }
+    let text_bytes = &haystack[abs + 12..abs - 4 + data_box_len];
+    let text = String::from_utf8_lossy(text_bytes).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+pub fn parse_local_audio_metadata(path: &Path) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    use std::io::{Read, Seek};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (None, None, None, None);
+    };
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let head_len = (file_len as usize).min(524_288);
+    let mut buf = vec![0u8; head_len];
+    if file.read_exact(&mut buf).is_err() {
+        return (None, None, None, None);
+    }
+
+    if buf.starts_with(b"ID3") {
+        return parse_id3v2_metadata(&buf);
+    }
+    if buf.starts_with(b"fLaC") {
+        return parse_flac_metadata(&buf);
+    }
+
+    // MP4 / M4A / ALAC: search head and tail (since udta/moov may sit at the end)
+    if buf.get(4..8) == Some(b"ftyp") {
+        let mut title = find_mp4_atom_text(&buf, b"\xa9nam");
+        let mut artist = find_mp4_atom_text(&buf, b"\xa9ART");
+        let mut album = find_mp4_atom_text(&buf, b"\xa9alb");
+        if (title.is_none() || artist.is_none()) && file_len > head_len as u64 {
+            let tail_len = (file_len as usize).min(262_144);
+            if file.seek(std::io::SeekFrom::End(-(tail_len as i64))).is_ok() {
+                let mut tail = vec![0u8; tail_len];
+                if file.read_exact(&mut tail).is_ok() {
+                    title = title.or_else(|| find_mp4_atom_text(&tail, b"\xa9nam"));
+                    artist = artist.or_else(|| find_mp4_atom_text(&tail, b"\xa9ART"));
+                    album = album.or_else(|| find_mp4_atom_text(&tail, b"\xa9alb"));
+                }
+            }
+        }
+        return (title, artist, album, None);
+    }
+
+    (None, None, None, None)
+}
+
+fn collect_audio_files_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 3 || out.len() >= 500 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= 500 {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_audio_files_recursive(&path, depth + 1, out);
+        } else if path.is_file() {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(
+                ext.as_str(),
+                "flac" | "wav" | "mp3" | "ogg" | "m4a" | "alac" | "aiff" | "opus"
+            ) {
+                out.push(path);
+            }
+        }
+    }
+}
+
+fn fnv1a_64(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in input.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+pub async fn scan_local_music_dir(
+    state: &AppState,
+    folder_path: Option<String>,
+    _proxy_port: u16,
+) -> Result<(String, Vec<Track>), String> {
+    let root_dir = if let Some(custom) = folder_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        PathBuf::from(custom)
+    } else {
+        let mut candidate = None;
+        #[cfg(target_os = "windows")]
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let music = PathBuf::from(profile).join("Music");
+            if music.exists() {
+                candidate = Some(music);
+            }
+        }
+        if candidate.is_none() {
+            if let Some(home) = std::env::var_os("HOME") {
+                let music = PathBuf::from(home).join("Music");
+                if music.exists() {
+                    candidate = Some(music);
+                }
+            }
+        }
+        match candidate {
+            Some(c) => c,
+            None => resolve_downloads_dir(state).await,
+        }
+    };
+
+    if !root_dir.exists() || !root_dir.is_dir() {
+        return Err(format!("指定的音樂資料夾不存在：{}", root_dir.display()));
+    }
+
+    let root_clone = root_dir.clone();
+    let tracks = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        collect_audio_files_recursive(&root_clone, 0, &mut files);
+        files.sort();
+        files
+            .into_iter()
+            .map(|p| {
+                let full_str = p.to_string_lossy().to_string();
+                let (title_opt, artist_opt, album_opt, cover_opt) = parse_local_audio_metadata(&p);
+                let stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unknown Track")
+                    .to_string();
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("LOCAL")
+                    .to_ascii_uppercase();
+                let parent_name = p
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("本機無損音檔")
+                    .to_string();
+                Track {
+                    video_id: format!("local-{:016x}", fnv1a_64(&full_str)),
+                    title: title_opt.unwrap_or(stem),
+                    artist: artist_opt.unwrap_or(parent_name),
+                    album: album_opt.unwrap_or(ext),
+                    duration_text: "Local".to_string(),
+                    duration_seconds: 0,
+                    thumbnail_url: cover_opt.unwrap_or_default(),
+                    is_auto_recommended: false,
+                    local_file_path: Some(full_str),
+                }
+            })
+            .collect::<Vec<Track>>()
+    })
+    .await
+    .map_err(|e| format!("掃描本機資料夾失敗: {e}"))?;
+
+    let resolved_path = root_dir.to_string_lossy().to_string();
+    let base_dir = resolve_base_data_dir(state).await;
+    let _guard = state.store_lock.lock().await;
+    let mut store = crate::storage::load_store_in_dir(&base_dir);
+    store.local_folder_path = Some(resolved_path.clone());
+    store.local_tracks = tracks.clone();
+    let _ = crate::storage::save_store_in_dir(&base_dir, &store);
+
+    Ok((resolved_path, tracks))
 }

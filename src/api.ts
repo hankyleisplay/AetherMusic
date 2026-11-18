@@ -2,9 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AudioQuality,
   CacheStats,
+  CustomPlaylist,
   DownloadResult,
   EngineStatus,
+  EntityDetail,
   HomeSection,
+  ListeningStats,
   LyricsResponse,
   LyricsSourcePreference,
   PersistedSettings,
@@ -22,6 +25,26 @@ export async function searchMusic(
   filter: SearchFilter = "songs"
 ): Promise<Track[]> {
   return invoke<Track[]>("search_music", { query, filter });
+}
+
+export async function getSearchSuggestions(query: string): Promise<string[]> {
+  return invoke<string[]>("get_search_suggestions_cmd", { query });
+}
+
+export async function getEntityDetail(kind: string, name: string): Promise<EntityDetail> {
+  return invoke<EntityDetail>("get_entity_detail_cmd", { kind, name });
+}
+
+export async function importYoutubePlaylist(urlOrId: string): Promise<[string, Track[]]> {
+  return invoke<[string, Track[]]>("import_youtube_playlist_cmd", { urlOrId });
+}
+
+export async function scanLocalMusic(folderPath?: string): Promise<[string, Track[]]> {
+  return invoke<[string, Track[]]>("scan_local_music_cmd", { folderPath });
+}
+
+export async function setMiniPlayerMode(mini: boolean): Promise<void> {
+  return invoke<void>("set_mini_player_mode", { mini });
 }
 
 export async function getSongDetail(videoId: string): Promise<SongMetadata> {
@@ -62,8 +85,8 @@ export async function getRecommendations(videoId: string): Promise<Track[]> {
   return invoke<Track[]>("get_recommendations", { videoId });
 }
 
-export async function getHomeDiscovery(): Promise<HomeSection[]> {
-  return invoke<HomeSection[]>("get_home_discovery");
+export async function getHomeDiscovery(seedArtist?: string): Promise<HomeSection[]> {
+  return invoke<HomeSection[]>("get_home_discovery", { seedArtist });
 }
 
 export async function getEngineStatus(forceRedetect = false): Promise<EngineStatus> {
@@ -76,6 +99,14 @@ export async function checkForUpdates(): Promise<UpdateStatus> {
 
 export async function runCoreUpdate(): Promise<UpdateActionResult> {
   return invoke<UpdateActionResult>("run_core_update");
+}
+
+export async function runAppUpdate(): Promise<UpdateActionResult> {
+  return invoke<UpdateActionResult>("run_app_update");
+}
+
+export async function openExternalUrl(url: string): Promise<void> {
+  return invoke<void>("open_external_url", { url });
 }
 
 export async function triggerAudioCache(
@@ -139,4 +170,35 @@ export async function savePlaybackSnapshot(params: {
   settings: PersistedSettings;
 }): Promise<void> {
   return invoke<void>("save_playback_snapshot", params);
+}
+
+export async function savePlaylistsDb(playlists: CustomPlaylist[]): Promise<CustomPlaylist[]> {
+  return invoke<CustomPlaylist[]>("save_playlists_db", { playlists });
+}
+
+export async function saveLyricsOffsetDb(videoId: string, offsetSec: number): Promise<void> {
+  return invoke<void>("save_lyrics_offset_db", { videoId, offsetSec });
+}
+
+export async function recordListeningStatDb(
+  track: Track,
+  listenedSeconds: number,
+  monthKey: string
+): Promise<ListeningStats> {
+  return invoke<ListeningStats>("record_listening_stat_db", {
+    track,
+    listenedSeconds,
+    monthKey,
+  });
+}
+
+export async function saveSearchHistoryDb(history: string[]): Promise<string[]> {
+  return invoke<string[]>("save_search_history_db", { history });
+}
+
+export async function exportPlaylistFile(
+  playlist: CustomPlaylist,
+  format: "json" | "m3u"
+): Promise<string> {
+  return invoke<string>("export_playlist_file", { playlist, format });
 }

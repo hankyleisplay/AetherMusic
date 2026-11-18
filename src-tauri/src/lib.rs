@@ -8,8 +8,8 @@ pub mod ytdlp;
 pub mod ytmapi;
 
 use models::{
-    AppState, CacheStats, DownloadResult, EngineStatus, HomeSection, LyricsResponse, SongMetadata,
-    StreamInfo, Track, UpdateActionResult, UpdateStatus,
+    AppState, CacheStats, DownloadResult, EngineStatus, EntityDetail, HomeSection, LyricsResponse,
+    SongMetadata, StreamInfo, Track, UpdateActionResult, UpdateStatus,
 };
 use std::sync::atomic::Ordering;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -85,8 +85,67 @@ async fn get_recommendations(
 }
 
 #[tauri::command]
-async fn get_home_discovery(state: State<'_, AppState>) -> Result<Vec<HomeSection>, String> {
-    ytmapi::get_home_sections(&state).await
+async fn get_home_discovery(
+    state: State<'_, AppState>,
+    seed_artist: Option<String>,
+) -> Result<Vec<HomeSection>, String> {
+    ytmapi::get_home_sections(&state, seed_artist.as_deref()).await
+}
+
+#[tauri::command]
+async fn get_search_suggestions_cmd(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<String>, String> {
+    ytmapi::get_search_suggestions(&state, &query).await
+}
+
+#[tauri::command]
+async fn get_entity_detail_cmd(
+    state: State<'_, AppState>,
+    kind: String,
+    name: String,
+) -> Result<EntityDetail, String> {
+    ytmapi::get_entity_detail(&state, &kind, &name).await
+}
+
+#[tauri::command]
+async fn import_youtube_playlist_cmd(
+    state: State<'_, AppState>,
+    url_or_id: String,
+) -> Result<(String, Vec<Track>), String> {
+    ytmapi::import_youtube_playlist(&state, &url_or_id).await
+}
+
+#[tauri::command]
+async fn scan_local_music_cmd(
+    state: State<'_, AppState>,
+    folder_path: Option<String>,
+) -> Result<(String, Vec<Track>), String> {
+    let port = *state.proxy_port.read().await;
+    cache::scan_local_music_dir(&state, folder_path, port).await
+}
+
+#[tauri::command]
+async fn set_mini_player_mode(app: tauri::AppHandle, mini: bool) -> Result<(), String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if let Some(win) = app.get_webview_window("main") {
+            if mini {
+                let _ = win.unmaximize();
+                let _ = win.set_min_size(Some(tauri::LogicalSize::new(360.0, 152.0)));
+                let _ = win.set_size(tauri::LogicalSize::new(430.0, 196.0));
+                let _ = win.set_always_on_top(true);
+            } else {
+                let _ = win.set_always_on_top(false);
+                let _ = win.set_min_size(Some(tauri::LogicalSize::new(960.0, 640.0)));
+                let _ = win.set_size(tauri::LogicalSize::new(1280.0, 820.0));
+            }
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let _ = (app, mini);
+    Ok(())
 }
 
 #[tauri::command]
@@ -119,6 +178,19 @@ async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateStatus, S
 #[tauri::command]
 async fn run_core_update(state: State<'_, AppState>) -> Result<UpdateActionResult, String> {
     updater::perform_core_update(&state).await
+}
+
+#[tauri::command]
+async fn run_app_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UpdateActionResult, String> {
+    updater::perform_app_update(&state, Some(app)).await
+}
+
+#[tauri::command]
+async fn open_external_url(url: String) -> Result<(), String> {
+    updater::open_url_in_browser(&url)
 }
 
 #[tauri::command]
@@ -209,8 +281,106 @@ fn configure_windows_webview_data_dir() {
     std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", chosen_dir);
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn resolve_single_instance_port_file() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME").map(|h| {
+        std::path::PathBuf::from(h)
+            .join("Library")
+            .join("Application Support")
+    });
+    #[cfg(target_os = "linux")]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local").join("share")));
+    base.map(|b| b.join("com.hankyleisplay.aethermusic").join("instance.port"))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn try_focus_existing_instance() -> bool {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let Some(port_file) = resolve_single_instance_port_file() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&port_file) else {
+        return false;
+    };
+    let Ok(port) = raw.trim().parse::<u16>() else {
+        return false;
+    };
+    if port == 0 {
+        return false;
+    }
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+    let req = format!("GET /focus HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut resp = [0u8; 64];
+    let n = stream.read(&mut resp).unwrap_or(0);
+    let head = String::from_utf8_lossy(&resp[..n]);
+    head.contains("200 OK")
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn configure_platform_window(win: &tauri::WebviewWindow) {
+    use tauri::window::{Effect, EffectState, EffectsBuilder};
+
+    #[cfg(target_os = "windows")]
+    {
+        if win
+            .set_effects(
+                EffectsBuilder::new()
+                    .effect(Effect::MicaDark)
+                    .state(EffectState::Active)
+                    .build(),
+            )
+            .is_err()
+        {
+            let _ = win.set_effects(
+                EffectsBuilder::new()
+                    .effect(Effect::Acrylic)
+                    .state(EffectState::Active)
+                    .build(),
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = win.set_effects(
+            EffectsBuilder::new()
+                .effect(Effect::UnderWindowBackground)
+                .state(EffectState::Active)
+                .build(),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux GTK/WebKitGTK falls back cleanly to CSS translucent dark surface without compositor crashes
+        let _ = (win, Effect::Blur, EffectState::Active, EffectsBuilder::new());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if try_focus_existing_instance() {
+        return;
+    }
+
     #[cfg(target_os = "windows")]
     {
         if let Ok(path_val) = std::env::var("PATH") {
@@ -228,6 +398,8 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<AppState>().inner().clone();
             let maybe_data_dir = app.path().app_data_dir().ok();
+            let maybe_cache_dir = app.path().app_cache_dir().ok();
+            let handle_for_state = app.handle().clone();
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
@@ -268,6 +440,9 @@ pub fn run() {
                                     let _ = tx.send(models::SmtcCommand::Shutdown);
                                 }
                             }
+                            if let Some(port_file) = resolve_single_instance_port_file() {
+                                let _ = std::fs::remove_file(port_file);
+                            }
                             app.exit(0);
                         }
                         _ => {}
@@ -293,8 +468,9 @@ pub fn run() {
                 }
                 let _ = tray_builder.build(app)?;
 
-                #[cfg(target_os = "windows")]
                 if let Some(main_win) = app.get_webview_window("main") {
+                    configure_platform_window(&main_win);
+                    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
                     if let Some(tx) = smtc::init_smtc(app.handle().clone(), &main_win) {
                         if let Ok(mut guard) = state.smtc_tx.try_write() {
                             *guard = Some(tx);
@@ -304,8 +480,29 @@ pub fn run() {
             }
 
             tauri::async_runtime::spawn(async move {
-                if let Some(data_dir) = maybe_data_dir {
+                let (focus_tx, mut focus_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                *state.focus_tx.write().await = Some(focus_tx);
+                let focus_handle = handle_for_state.clone();
+                tokio::spawn(async move {
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    let _ = &focus_handle;
+                    while focus_rx.recv().await.is_some() {
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        {
+                            if let Some(win) = focus_handle.get_webview_window("main") {
+                                let _ = win.unminimize();
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                            }
+                            let _ = focus_handle.emit("instance-focus", ());
+                        }
+                    }
+                });
+                if let Some(data_dir) = maybe_data_dir.clone() {
                     *state.app_data_dir.write().await = Some(data_dir);
+                }
+                if let Some(cache_dir) = maybe_cache_dir {
+                    *state.app_cache_dir.write().await = Some(cache_dir);
                 }
 
                 // Sync persisted close_to_tray preference at startup
@@ -321,8 +518,26 @@ pub fn run() {
                     proxy::start_proxy_server(state_proxy),
                     ytdlp::detect_or_setup_ytdlp(&state_detect, false)
                 );
-                if let Err(e) = proxy_res {
-                    eprintln!("Warning: could not start local audio proxy: {e}");
+                match proxy_res {
+                    Ok(port) => {
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        {
+                            let port_file = maybe_data_dir
+                                .map(|d| d.join("instance.port"))
+                                .or_else(resolve_single_instance_port_file);
+                            if let Some(pf) = port_file {
+                                if let Some(parent) = pf.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let _ = std::fs::write(pf, port.to_string());
+                            }
+                        }
+                        #[cfg(any(target_os = "android", target_os = "ios"))]
+                        let _ = port;
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: could not start local audio proxy: {e}");
+                    }
                 }
             });
 
@@ -351,9 +566,16 @@ pub fn run() {
             prefetch_stream,
             get_recommendations,
             get_home_discovery,
+            get_search_suggestions_cmd,
+            get_entity_detail_cmd,
+            import_youtube_playlist_cmd,
+            scan_local_music_cmd,
+            set_mini_player_mode,
             get_engine_status,
             check_for_updates,
             run_core_update,
+            run_app_update,
+            open_external_url,
             trigger_audio_cache,
             get_cache_stats,
             clear_audio_cache,
@@ -365,6 +587,11 @@ pub fn run() {
             storage::record_play_history_db,
             storage::clear_play_history_db,
             storage::save_playback_snapshot,
+            storage::save_playlists_db,
+            storage::save_lyrics_offset_db,
+            storage::record_listening_stat_db,
+            storage::save_search_history_db,
+            storage::export_playlist_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AetherMusic tauri application");
@@ -631,6 +858,7 @@ mod tests {
             duration_seconds: 269,
             thumbnail_url: "https://i.ytimg.com/vi/abc123XYZ/hqdefault.jpg".to_string(),
             is_auto_recommended: false,
+            local_file_path: None,
         };
 
         let favs = storage::toggle_favorite_in_dir(&tmp_dir, track.clone()).expect("add fav");
@@ -657,6 +885,39 @@ mod tests {
         // Toggle removes favorite cleanly
         let favs_after = storage::toggle_favorite_in_dir(&tmp_dir, track).expect("remove fav");
         assert!(favs_after.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_updater_semver_comparison() {
+        assert!(updater::is_newer_version("v0.2.1", "0.2.0"));
+        assert!(updater::is_newer_version("0.2.1", "0.2.0"));
+        assert!(!updater::is_newer_version("0.2.1", "0.2.1"));
+        assert!(!updater::is_newer_version("0.2.0", "0.2.1"));
+        assert!(updater::is_newer_version("2026.11.0", "0.2.1"));
+        assert!(updater::is_newer_version("2026.11.1", "2026.11.0"));
+        assert!(!updater::is_newer_version("2026.11.0", "2026.11.0"));
+        assert!(updater::is_newer_version("2026.11.01", "2026.10.26"));
+        assert!(!updater::is_newer_version("2026.10.26", "2026.10.26"));
+        assert!(!updater::is_newer_version("", "0.2.1"));
+    }
+
+    #[test]
+    fn test_local_audio_metadata_id3_parsing() {
+        let tmp_dir = std::env::temp_dir().join(format!("aethermusic_test_meta_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let mp3_path = tmp_dir.join("test_song.mp3");
+        let fake_jpg = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46];
+        let mut bytes = cache::build_id3v23_tag("稻香", "周杰倫", "魔杰座", Some((&fake_jpg, "image/jpeg")));
+        bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        std::fs::write(&mp3_path, &bytes).expect("write test mp3");
+
+        let (title, artist, album, cover) = cache::parse_local_audio_metadata(&mp3_path);
+        assert_eq!(title.as_deref(), Some("稻香"));
+        assert_eq!(artist.as_deref(), Some("周杰倫"));
+        assert_eq!(album.as_deref(), Some("魔杰座"));
+        assert!(cover.as_deref().unwrap_or("").starts_with("data:image/jpeg;base64,"));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

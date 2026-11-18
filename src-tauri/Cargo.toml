@@ -1,6 +1,6 @@
 [package]
 name = "aether-music"
-version = "0.2.1"
+version = "2026.11.0"
 description = "AetherMusic - Cloud streaming music player powered by Tauri, Rust, yt-dlp, and YTMAPI"
 authors = ["HANSON <hankyleisplay@gmail.com>"]
 license = "GPL-3.0-only"
@@ -25,5 +25,5 @@ futures-util = "0.3"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 souvlaki = "0.9"

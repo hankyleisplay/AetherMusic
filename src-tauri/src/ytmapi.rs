@@ -1,4 +1,7 @@
-use crate::models::{AppState, HomeSection, LyricLine, LyricsResponse, SongMetadata, Track};
+use crate::models::{
+    AppState, EntityDetail, HomeSection, LyricLine, LyricsResponse, RelatedEntity, SongMetadata,
+    Track,
+};
 use crate::ytdlp;
 use serde_json::{json, Value};
 
@@ -259,6 +262,7 @@ fn parse_responsive_list_item(item: &Value, is_auto: bool) -> Option<Track> {
         duration_seconds,
         thumbnail_url,
         is_auto_recommended: is_auto,
+        local_file_path: None,
     })
 }
 
@@ -293,6 +297,7 @@ fn parse_two_row_item(item: &Value, is_auto: bool) -> Option<Track> {
         duration_seconds,
         thumbnail_url,
         is_auto_recommended: is_auto,
+        local_file_path: None,
     })
 }
 
@@ -324,6 +329,7 @@ fn parse_playlist_panel_video(item: &Value, is_auto: bool) -> Option<Track> {
         duration_seconds,
         thumbnail_url,
         is_auto_recommended: is_auto,
+        local_file_path: None,
     })
 }
 
@@ -391,6 +397,7 @@ fn extract_search_tracks_from_data(data: &Value) -> Vec<Track> {
                             duration_seconds: dur_s,
                             thumbnail_url: thumb,
                             is_auto_recommended: false,
+                            local_file_path: None,
                         });
                     }
                 }
@@ -427,11 +434,18 @@ pub async fn search_tracks(
         return Ok(extract_search_tracks_from_data(&data));
     }
 
+    let effective_query = match filter_mode {
+        "artists" => format!("{trimmed} 代表作 熱門歌曲"),
+        "albums" => format!("{trimmed} 專輯 Album"),
+        "playlists" => format!("{trimmed} 精選歌單 Mix Playlist"),
+        _ => trimmed.to_string(),
+    };
+
     let mut general_body = ytm_context();
-    general_body["query"] = json!(trimmed);
+    general_body["query"] = json!(&effective_query);
 
     let mut songs_body = ytm_context();
-    songs_body["query"] = json!(trimmed);
+    songs_body["query"] = json!(&effective_query);
     songs_body["params"] = json!("EgWKAQIIAWoKEAkQBRAKEAMQBA==");
 
     let (general_res, songs_res) = tokio::join!(
@@ -845,7 +859,7 @@ async fn fetch_lrclib_lyrics(
         if let Ok(resp) = state
             .http_client
             .get(&url)
-            .header("User-Agent", "AetherMusic/0.1.0 (https://github.com/hankyleisplay/AetherMusic)")
+            .header("User-Agent", concat!("AetherMusic/", env!("CARGO_PKG_VERSION"), " (https://github.com/hankyleisplay/AetherMusic)"))
             .send()
             .await
         {
@@ -866,7 +880,7 @@ async fn fetch_lrclib_lyrics(
             if let Ok(resp) = state
                 .http_client
                 .get(&url)
-                .header("User-Agent", "AetherMusic/0.1.0 (https://github.com/hankyleisplay/AetherMusic)")
+                .header("User-Agent", concat!("AetherMusic/", env!("CARGO_PKG_VERSION"), " (https://github.com/hankyleisplay/AetherMusic)"))
                 .send()
                 .await
             {
@@ -1090,28 +1104,67 @@ pub async fn get_lyrics(
     }
 }
 
-pub async fn get_home_sections(state: &AppState) -> Result<Vec<HomeSection>, String> {
+pub async fn get_home_sections(
+    state: &AppState,
+    seed_artist: Option<&str>,
+) -> Result<Vec<HomeSection>, String> {
+    let clean_seed = seed_artist.map(str::trim).filter(|s| !s.is_empty() && *s != "未知藝人");
+    let (daily_title, daily_sub, daily_query) = match clean_seed {
+        Some(artist) => (
+            "為你推薦 · Daily Mix".to_string(),
+            format!("根據您近期常聽的 {artist} 動態編排專屬推薦"),
+            format!("{artist} 精選熱門歌曲"),
+        ),
+        None => (
+            "為你推薦 · Daily Mix".to_string(),
+            "依即時音樂潮流與聆聽品味為您編排".to_string(),
+            "華語日韓歐美精選推薦熱門單曲".to_string(),
+        ),
+    };
+
     let queries = [
-        ("華語流行熱門", "即時熱門華語金曲與經典單曲", "華語流行熱門歌曲 周杰倫 林俊傑 鄧紫棋"),
-        ("日語動漫 & J-Pop", "YOASOBI, 米津玄師, Ado 與人氣動畫主題曲", "J-Pop Anime Hits YOASOBI 米津玄師"),
-        ("歐美流行精選", "全球排行榜熱門單曲與話題新作", "Global Top Pop Hits 2025"),
-        ("Lo-Fi & 專注節拍", "適合編程、閱讀與深夜放鬆的氛圍節奏", "Lo-Fi Chill Beats Study Relax"),
+        (
+            daily_title,
+            daily_sub,
+            daily_query,
+        ),
+        (
+            "熱門排行榜 · Top Charts".to_string(),
+            "全球及亞洲即時熱門單曲排行榜".to_string(),
+            "Global Top Pop Chart Hits 2026".to_string(),
+        ),
+        (
+            "華語流行精選".to_string(),
+            "即時熱門華語金曲與經典單曲".to_string(),
+            "華語流行熱門歌曲 周杰倫 林俊傑 鄧紫棋".to_string(),
+        ),
+        (
+            "日語動漫 & J-Pop".to_string(),
+            "YOASOBI, 米津玄師, Ado 與人氣動畫主題曲".to_string(),
+            "J-Pop Anime Hits YOASOBI 米津玄師".to_string(),
+        ),
+        (
+            "依曲風/心情探索 · 深夜專注".to_string(),
+            "Lo-Fi、Synthwave 與深夜放鬆的氛圍節奏".to_string(),
+            "Lo-Fi Chill Beats Synthwave Study Relax".to_string(),
+        ),
     ];
 
-    let (r0, r1, r2, r3) = tokio::join!(
-        search_tracks(state, queries[0].2, Some("songs")),
-        search_tracks(state, queries[1].2, Some("songs")),
-        search_tracks(state, queries[2].2, Some("songs")),
-        search_tracks(state, queries[3].2, Some("songs")),
+    let (r0, r1, r2, r3, r4) = tokio::join!(
+        search_tracks(state, &queries[0].2, Some("songs")),
+        search_tracks(state, &queries[1].2, Some("songs")),
+        search_tracks(state, &queries[2].2, Some("songs")),
+        search_tracks(state, &queries[3].2, Some("songs")),
+        search_tracks(state, &queries[4].2, Some("songs")),
     );
 
     let mut sections = Vec::new();
-    for (idx, res) in [r0, r1, r2, r3].into_iter().enumerate() {
+    for (idx, res) in [r0, r1, r2, r3, r4].into_iter().enumerate() {
         if let Ok(tracks) = res {
             if !tracks.is_empty() {
                 sections.push(HomeSection {
-                    title: queries[idx].0.to_string(),
-                    subtitle: queries[idx].1.to_string(),
+                    title: queries[idx].0.clone(),
+                    subtitle: queries[idx].1.clone(),
                     tracks: tracks.into_iter().take(12).collect(),
                 });
             }
@@ -1123,4 +1176,252 @@ pub async fn get_home_sections(state: &AppState) -> Result<Vec<HomeSection>, Str
     }
 
     Ok(sections)
+}
+
+pub async fn get_search_suggestions(state: &AppState, query: &str) -> Result<Vec<String>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut body = ytm_context();
+    body["input"] = json!(trimmed);
+
+    let mut suggestions = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if let Ok(data) = post_ytm(state, "music/get_search_suggestions", body).await {
+        if let Some(sections) = data.get("contents").and_then(|v| v.as_array()) {
+            for sec in sections {
+                if let Some(items) = sec
+                    .pointer("/searchSuggestionsSectionRenderer/contents")
+                    .and_then(|v| v.as_array())
+                {
+                    for item in items {
+                        let txt = collect_runs_text(
+                            item.pointer("/searchSuggestionRenderer/suggestion/runs"),
+                        );
+                        let clean = txt.trim().to_string();
+                        if !clean.is_empty() && seen.insert(clean.to_lowercase()) {
+                            suggestions.push(clean);
+                        }
+                        if suggestions.len() >= 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(suggestions)
+}
+
+pub async fn get_entity_detail(
+    state: &AppState,
+    kind: &str,
+    name: &str,
+) -> Result<EntityDetail, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("請提供歌手或專輯名稱".to_string());
+    }
+
+    let is_album = kind.eq_ignore_ascii_case("album");
+    let filter = if is_album { "albums" } else { "artists" };
+    let tracks = search_tracks(state, trimmed, Some(filter)).await?;
+    if tracks.is_empty() {
+        return Err(format!("找不到「{trimmed}」的相關曲目"));
+    }
+
+    let lead = &tracks[0];
+    let thumbnail_url = lead.thumbnail_url.clone();
+
+    let mut album_map: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut albums = Vec::new();
+    for t in &tracks {
+        let alb = t.album.trim();
+        if !alb.is_empty() && album_map.insert(alb.to_lowercase()) {
+            albums.push(RelatedEntity {
+                name: alb.to_string(),
+                subtitle: t.artist.clone(),
+                thumbnail_url: t.thumbnail_url.clone(),
+                kind: "album".to_string(),
+                browse_id: None,
+            });
+        }
+        if albums.len() >= 8 {
+            break;
+        }
+    }
+
+    let mut related_artists = Vec::new();
+    let mut seen_artists: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen_artists.insert(trimmed.to_lowercase());
+    if let Ok(recs) = get_radio_recommendations(state, &lead.video_id).await {
+        for r in recs {
+            let art = r.artist.trim();
+            if !art.is_empty()
+                && art != "未知藝人"
+                && seen_artists.insert(art.to_lowercase())
+            {
+                related_artists.push(RelatedEntity {
+                    name: art.to_string(),
+                    subtitle: format!("代表作：{}", r.title),
+                    thumbnail_url: r.thumbnail_url.clone(),
+                    kind: "artist".to_string(),
+                    browse_id: None,
+                });
+            }
+            if related_artists.len() >= 8 {
+                break;
+            }
+        }
+    }
+
+    let subtitle = if is_album {
+        format!("專輯精選 · {} · {} 首曲目", lead.artist, tracks.len())
+    } else {
+        format!("藝人專頁 · 收錄 {} 首熱門歌曲與 {} 張相關專輯", tracks.len(), albums.len())
+    };
+    let description = if is_album {
+        format!("由 YTMAPI 即時彙整「{trimmed}」專輯相關音軌與高解析串流清單。")
+    } else {
+        format!("由 YTMAPI 即時彙整「{trimmed}」的熱門代表作、專輯收錄與相似曲風藝人推薦。")
+    };
+
+    Ok(EntityDetail {
+        kind: if is_album { "album".to_string() } else { "artist".to_string() },
+        name: trimmed.to_string(),
+        subtitle,
+        description,
+        thumbnail_url,
+        tracks,
+        albums,
+        related_artists,
+    })
+}
+
+fn extract_query_param(url: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let pos = url.find(&needle)?;
+    let rest = &url[pos + needle.len()..];
+    let val = rest.split(['&', '#', '/', ' ']).next()?.trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+pub async fn import_youtube_playlist(
+    state: &AppState,
+    url_or_id: &str,
+) -> Result<(String, Vec<Track>), String> {
+    let trimmed = url_or_id.trim();
+    if trimmed.is_empty() {
+        return Err("請輸入 YouTube / YouTube Music 播放清單網址或 ID".to_string());
+    }
+
+    let playlist_id = extract_query_param(trimmed, "list").or_else(|| {
+        if !trimmed.contains('/') && !trimmed.contains(' ')
+            && (trimmed.starts_with("PL")
+                || trimmed.starts_with("OLAK")
+                || trimmed.starts_with("RD")
+                || trimmed.starts_with("VL"))
+        {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    });
+
+    if let Some(raw_pid) = playlist_id {
+        let pid = raw_pid.strip_prefix("VL").unwrap_or(&raw_pid).to_string();
+        let browse_id = format!("VL{pid}");
+        let mut browse_body = ytm_context();
+        browse_body["browseId"] = json!(browse_id);
+
+        let mut playlist_title = format!("匯入歌單 ({pid})");
+        let mut tracks = Vec::new();
+
+        if let Ok(data) = post_ytm(state, "browse", browse_body).await {
+            let title_cand = collect_runs_text(data.pointer("/header/musicDetailHeaderRenderer/title/runs"))
+                .trim()
+                .to_string();
+            let title_cand2 = collect_runs_text(data.pointer("/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicResponsiveHeaderRenderer/title/runs"))
+                .trim()
+                .to_string();
+            if !title_cand.is_empty() {
+                playlist_title = title_cand;
+            } else if !title_cand2.is_empty() {
+                playlist_title = title_cand2;
+            }
+
+            let section_paths = [
+                "/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents",
+                "/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents",
+            ];
+            for sp in section_paths {
+                if let Some(secs) = data.pointer(sp).and_then(|v| v.as_array()) {
+                    for sec in secs {
+                        for shelf_key in ["/musicPlaylistShelfRenderer/contents", "/musicShelfRenderer/contents"] {
+                            if let Some(items) = sec.pointer(shelf_key).and_then(|v| v.as_array()) {
+                                for item in items {
+                                    if let Some(t) = parse_responsive_list_item(item, false) {
+                                        tracks.push(t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if tracks.is_empty() {
+            let mut next_body = ytm_context();
+            next_body["playlistId"] = json!(&pid);
+            next_body["isAudioOnly"] = json!(true);
+            if let Ok(next_data) = post_ytm(state, "next", next_body).await {
+                tracks = extract_playlist_panel_tracks(&next_data, "");
+            }
+        }
+
+        if tracks.is_empty() {
+            return Err("無法從此播放清單擷取歌曲，請確認清單為公開狀態".to_string());
+        }
+        return Ok((playlist_title, tracks));
+    }
+
+    // Fallback: single YouTube watch URL -> import track + radio mix
+    let vid = extract_query_param(trimmed, "v").or_else(|| {
+        trimmed
+            .split("youtu.be/")
+            .nth(1)
+            .and_then(|s| s.split(['?', '&', '/']).next())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+
+    if let Some(video_id) = vid {
+        let meta = get_song_metadata(state, &video_id).await?;
+        let mut tracks = vec![Track {
+            video_id: meta.video_id.clone(),
+            title: meta.title.clone(),
+            artist: meta.artist.clone(),
+            album: meta.album.clone(),
+            duration_text: meta.duration_text.clone(),
+            duration_seconds: meta.duration_seconds,
+            thumbnail_url: meta.thumbnail_url.clone(),
+            is_auto_recommended: false,
+            local_file_path: None,
+        }];
+        if let Ok(recs) = get_radio_recommendations(state, &video_id).await {
+            tracks.extend(recs.into_iter().take(15));
+        }
+        return Ok((format!("{} 電台歌單", meta.title), tracks));
+    }
+
+    Err("無法辨識的 YouTube / YouTube Music 網址格式".to_string())
 }

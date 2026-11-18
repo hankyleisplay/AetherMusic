@@ -17,6 +17,8 @@ pub struct Track {
     pub thumbnail_url: String,
     #[serde(default)]
     pub is_auto_recommended: bool,
+    #[serde(default)]
+    pub local_file_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +103,8 @@ pub struct UpdateStatus {
     pub ytdlp_latest_version: String,
     pub ytdlp_update_available: bool,
     pub last_checked: String,
+    pub installer_url: Option<String>,
+    pub installer_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +114,8 @@ pub struct UpdateActionResult {
     pub message: String,
     pub updated_ytdlp_version: String,
     pub release_url: String,
+    #[serde(default)]
+    pub app_update_launched: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,11 +139,61 @@ pub struct CacheStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RelatedEntity {
+    pub name: String,
+    pub subtitle: String,
+    pub thumbnail_url: String,
+    pub kind: String,
+    pub browse_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityDetail {
+    pub kind: String,
+    pub name: String,
+    pub subtitle: String,
+    pub description: String,
+    pub thumbnail_url: String,
+    pub tracks: Vec<Track>,
+    pub albums: Vec<RelatedEntity>,
+    pub related_artists: Vec<RelatedEntity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomPlaylist {
+    pub id: String,
+    pub name: String,
+    pub cover_url: Option<String>,
+    pub created_at_ms: u64,
+    pub tracks: Vec<Track>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListeningStats {
+    pub total_listen_seconds: u64,
+    pub monthly_listen_seconds: HashMap<String, u64>,
+    pub track_play_counts: HashMap<String, u32>,
+    pub artist_play_counts: HashMap<String, u32>,
+}
+
+fn default_eq_bands() -> Vec<f64> {
+    vec![0.0; 10]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EqSettings {
     pub low: f64,
     pub mid: f64,
     pub high: f64,
     pub preset: String,
+    #[serde(default = "default_eq_bands")]
+    pub bands: Vec<f64>,
+    #[serde(default = "default_eq_bands")]
+    pub custom_bands: Vec<f64>,
 }
 
 impl Default for EqSettings {
@@ -147,6 +203,8 @@ impl Default for EqSettings {
             mid: 0.0,
             high: 0.0,
             preset: "flat".to_string(),
+            bands: vec![0.0; 10],
+            custom_bands: vec![0.0; 10],
         }
     }
 }
@@ -166,10 +224,18 @@ pub struct PersistedSettings {
     pub eq: EqSettings,
     #[serde(default = "default_close_to_tray")]
     pub close_to_tray: bool,
+    #[serde(default)]
+    pub loudness_norm: bool,
+    #[serde(default = "default_visualizer_style")]
+    pub visualizer_style: String,
 }
 
 fn default_close_to_tray() -> bool {
     true
+}
+
+fn default_visualizer_style() -> String {
+    "bars".to_string()
 }
 
 impl Default for PersistedSettings {
@@ -186,6 +252,8 @@ impl Default for PersistedSettings {
             dj_vibe: "club".to_string(),
             eq: EqSettings::default(),
             close_to_tray: true,
+            loudness_norm: false,
+            visualizer_style: "bars".to_string(),
         }
     }
 }
@@ -199,6 +267,18 @@ pub struct UserStore {
     pub last_index: i32,
     pub last_position_sec: f64,
     pub settings: PersistedSettings,
+    #[serde(default)]
+    pub playlists: Vec<CustomPlaylist>,
+    #[serde(default)]
+    pub search_history: Vec<String>,
+    #[serde(default)]
+    pub lyrics_offsets: HashMap<String, f64>,
+    #[serde(default)]
+    pub listening_stats: ListeningStats,
+    #[serde(default)]
+    pub local_folder_path: Option<String>,
+    #[serde(default)]
+    pub local_tracks: Vec<Track>,
 }
 
 impl Default for UserStore {
@@ -210,6 +290,12 @@ impl Default for UserStore {
             last_index: -1,
             last_position_sec: 0.0,
             settings: PersistedSettings::default(),
+            playlists: Vec::new(),
+            search_history: Vec::new(),
+            lyrics_offsets: HashMap::new(),
+            listening_stats: ListeningStats::default(),
+            local_folder_path: None,
+            local_tracks: Vec::new(),
         }
     }
 }
@@ -255,6 +341,8 @@ pub struct AppState {
     pub proxy_port: Arc<RwLock<u16>>,
     pub ytdlp_cmd: Arc<RwLock<Option<YtDlpRunner>>>,
     pub app_data_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
+    pub app_cache_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
+    pub focus_tx: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     pub base_data_dir_override: Arc<RwLock<Option<std::path::PathBuf>>>,
     pub cache_in_flight: Arc<Mutex<HashSet<String>>>,
     pub cache_index_lock: Arc<Mutex<()>>,
@@ -279,6 +367,8 @@ impl AppState {
             proxy_port: Arc::new(RwLock::new(0)),
             ytdlp_cmd: Arc::new(RwLock::new(None)),
             app_data_dir: Arc::new(RwLock::new(None)),
+            app_cache_dir: Arc::new(RwLock::new(None)),
+            focus_tx: Arc::new(RwLock::new(None)),
             base_data_dir_override: Arc::new(RwLock::new(None)),
             cache_in_flight: Arc::new(Mutex::new(HashSet::new())),
             cache_index_lock: Arc::new(Mutex::new(())),
@@ -300,5 +390,11 @@ impl AppState {
         map.entry(video_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
     }
 }

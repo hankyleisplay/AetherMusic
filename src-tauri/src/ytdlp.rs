@@ -64,10 +64,10 @@ async fn has_node_runtime() -> bool {
     )
 }
 
-fn candidate_paths(app_data_dir: Option<&PathBuf>) -> Vec<YtDlpRunner> {
+fn candidate_paths(app_data_dirs: &[PathBuf]) -> Vec<YtDlpRunner> {
     let mut candidates = Vec::new();
 
-    if let Some(dir) = app_data_dir {
+    for dir in app_data_dirs {
         #[cfg(target_os = "windows")]
         let local_bin = dir.join("bin").join("yt-dlp.exe");
         #[cfg(not(target_os = "windows"))]
@@ -131,6 +131,84 @@ fn candidate_paths(app_data_dir: Option<&PathBuf>) -> Vec<YtDlpRunner> {
     candidates
 }
 
+#[cfg(not(target_os = "android"))]
+pub async fn download_standalone_ytdlp(state: &AppState) -> Result<(YtDlpRunner, String), String> {
+    let dir = crate::cache::resolve_base_data_dir(state).await;
+    let bin_dir = dir.join("bin");
+    tokio::fs::create_dir_all(&bin_dir)
+        .await
+        .map_err(|e| format!("Failed to create bin dir: {e}"))?;
+
+    #[cfg(target_os = "windows")]
+    let (url, filename) = (
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+        "yt-dlp.exe",
+    );
+    #[cfg(target_os = "linux")]
+    let (url, filename) = (
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
+        "yt-dlp",
+    );
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let (url, filename) = (
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
+        "yt-dlp",
+    );
+
+    let dest = bin_dir.join(filename);
+    let tmp_dest = bin_dir.join(format!("{filename}.tmp"));
+    let resp = state
+        .http_client
+        .get(url)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download yt-dlp: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Failed to download yt-dlp: HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed reading yt-dlp binary: {e}"))?;
+    if bytes.len() < 100_000 {
+        return Err("下載的 yt-dlp 二進位檔不完整".to_string());
+    }
+    tokio::fs::write(&tmp_dest, &bytes)
+        .await
+        .map_err(|e| format!("Failed saving yt-dlp: {e}"))?;
+    let _ = tokio::fs::remove_file(&dest).await;
+    tokio::fs::rename(&tmp_dest, &dest)
+        .await
+        .map_err(|e| format!("Failed finalizing yt-dlp binary: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = tokio::fs::metadata(&dest)
+            .await
+            .map_err(|e| e.to_string())?
+            .permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(&dest, perms)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let runner = YtDlpRunner::Executable(dest.to_string_lossy().to_string());
+    if let Some(ver) = test_runner(&runner).await {
+        *state.ytdlp_cmd.write().await = Some(runner.clone());
+        return Ok((runner, ver));
+    }
+
+    Err("下載後的 yt-dlp 無法通過執行驗證".to_string())
+}
+
+#[cfg(target_os = "android")]
+pub async fn download_standalone_ytdlp(_state: &AppState) -> Result<(YtDlpRunner, String), String> {
+    Err("Android 環境使用內建純 Rust InnerTube 音訊串流引擎".to_string())
+}
+
 pub async fn detect_or_setup_ytdlp(
     state: &AppState,
     allow_download: bool,
@@ -149,8 +227,16 @@ pub async fn detect_or_setup_ytdlp(
             }
         }
 
+        let base_dir = crate::cache::resolve_base_data_dir(state).await;
         let app_dir = state.app_data_dir.read().await.clone();
-        let candidates = candidate_paths(app_dir.as_ref());
+        let mut search_dirs = vec![base_dir];
+        if let Some(d) = app_dir {
+            if !search_dirs.contains(&d) {
+                search_dirs.push(d);
+            }
+        }
+
+        let candidates = candidate_paths(&search_dirs);
         for candidate in candidates {
             if let Some(ver) = test_runner(&candidate).await {
                 *state.ytdlp_cmd.write().await = Some(candidate.clone());
@@ -159,64 +245,8 @@ pub async fn detect_or_setup_ytdlp(
         }
 
         if allow_download {
-            if let Some(dir) = app_dir {
-                let bin_dir = dir.join("bin");
-                tokio::fs::create_dir_all(&bin_dir)
-                    .await
-                    .map_err(|e| format!("Failed to create bin dir: {e}"))?;
-
-                #[cfg(target_os = "windows")]
-                let (url, filename) = (
-                    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
-                    "yt-dlp.exe",
-                );
-                #[cfg(target_os = "linux")]
-                let (url, filename) = (
-                    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
-                    "yt-dlp",
-                );
-                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-                let (url, filename) = (
-                    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
-                    "yt-dlp",
-                );
-
-                let dest = bin_dir.join(filename);
-                let resp = state
-                    .http_client
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("Failed to download yt-dlp: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("Failed to download yt-dlp: HTTP {}", resp.status()));
-                }
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("Failed reading yt-dlp binary: {e}"))?;
-                tokio::fs::write(&dest, &bytes)
-                    .await
-                    .map_err(|e| format!("Failed saving yt-dlp: {e}"))?;
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = tokio::fs::metadata(&dest)
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .permissions();
-                    perms.set_mode(0o755);
-                    tokio::fs::set_permissions(&dest, perms)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-
-                let runner = YtDlpRunner::Executable(dest.to_string_lossy().to_string());
-                if let Some(ver) = test_runner(&runner).await {
-                    *state.ytdlp_cmd.write().await = Some(runner.clone());
-                    return Ok((runner, ver));
-                }
+            if let Ok(res) = download_standalone_ytdlp(state).await {
+                return Ok(res);
             }
         }
 

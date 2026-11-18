@@ -5,11 +5,12 @@ import {
   Loader2,
   Mic,
   Radio,
+  Save,
   Sliders,
   Sparkles,
   Volume2,
 } from "lucide-react";
-import type { DjVibeId, EqPreset, EqSettings, Track } from "../types";
+import type { DjVibeId, EqPreset, EqSettings, Track, VisualizerStyle } from "../types";
 import { AlbumArt } from "./AlbumArt";
 import { SpectrumCanvas } from "./SpectrumCanvas";
 
@@ -59,13 +60,63 @@ export const DJ_VIBES: DjVibeOption[] = [
   },
 ];
 
-export const EQ_PRESETS: Record<EqPreset, { label: string; low: number; mid: number; high: number }> = {
-  flat: { label: "Pure Direct 原音直通", low: 0, mid: 0, high: 0 },
-  hires: { label: "微調解析空氣感", low: 1.0, mid: 0, high: 1.5 },
-  bass: { label: "深沉重低音", low: 6, mid: -1, high: 1.5 },
-  club: { label: "DJ Club 現場", low: 5, mid: -2, high: 4 },
-  vocal: { label: "清晰人聲", low: -2, mid: 4.5, high: 2 },
+export const EQ_BAND_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000] as const;
+export const EQ_BAND_LABELS = [
+  "31",
+  "62",
+  "125",
+  "250",
+  "500",
+  "1k",
+  "2k",
+  "4k",
+  "8k",
+  "16k",
+] as const;
+
+export const EQ_PRESETS: Record<
+  Exclude<EqPreset, "custom">,
+  { label: string; bands: number[] }
+> = {
+  flat: { label: "原音直通", bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+  bass: { label: "重低音", bands: [6, 5.5, 4.5, 2.5, 0.5, 0, 0, 0.5, 1, 1.5] },
+  vocal: { label: "清晰人聲", bands: [-2.5, -2, -1, 1, 3, 4.5, 4, 2.5, 1.5, 0.5] },
+  pop: { label: "流行 Pop", bands: [1.5, 2.5, 3, 1.5, -0.5, 0.5, 2, 3, 2.5, 1.5] },
+  rock: { label: "搖滾 Rock", bands: [4, 3, 1.5, -1, -1.5, 0.5, 2.5, 4, 4.5, 3.5] },
+  classical: { label: "古典 Classical", bands: [2.5, 2, 1, 0, 0, 0, 1.5, 2.5, 3, 3.5] },
+  club: { label: "DJ Club", bands: [5.5, 5, 3, 0.5, -1.5, -1, 1.5, 3.5, 4.5, 4] },
+  hires: { label: "Hi-Res 解析", bands: [1.5, 1, 0.5, 0, 0, 0.5, 1, 1.5, 2.5, 3] },
 };
+
+export function summarizeBandsToTriBand(bands: number[]): {
+  low: number;
+  mid: number;
+  high: number;
+} {
+  const b = bands.length === 10 ? bands : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  const low = Number(((b[0] + b[1] + b[2]) / 3).toFixed(1));
+  const mid = Number(((b[4] + b[5] + b[6]) / 3).toFixed(1));
+  const high = Number(((b[8] + b[9]) / 2).toFixed(1));
+  return { low, mid, high };
+}
+
+export function resolveEqBands(eq: EqSettings): number[] {
+  if (eq.bands && eq.bands.length === 10) {
+    return eq.bands;
+  }
+  return [
+    eq.low,
+    eq.low * 0.85,
+    eq.low * 0.6,
+    eq.low * 0.25,
+    eq.mid * 0.6,
+    eq.mid,
+    eq.mid * 0.8,
+    eq.high * 0.5,
+    eq.high * 0.85,
+    eq.high,
+  ];
+}
 
 interface DjMixConsoleProps {
   currentTrack: Track | null;
@@ -80,11 +131,16 @@ interface DjMixConsoleProps {
   crossfadeSec: number;
   crossfadeActive: boolean;
   eq: EqSettings;
+  loudnessNorm: boolean;
+  visualizerStyle: VisualizerStyle;
   onToggleDj: () => void;
   onSelectVibe: (vibe: DjVibeOption) => void;
   onToggleDjVoice: () => void;
   onChangeCrossfadeSec: (sec: number) => void;
   onChangeEq: (next: EqSettings) => void;
+  onSaveCustomEq: () => void;
+  onToggleLoudnessNorm: () => void;
+  onChangeVisualizerStyle: (style: VisualizerStyle) => void;
   onSpeakNow: () => void;
   onTriggerCrossfadeNext: () => void;
   onImportLocalLossless: (files: FileList | null) => void;
@@ -103,16 +159,22 @@ export function DjMixConsole({
   crossfadeSec,
   crossfadeActive,
   eq,
+  loudnessNorm,
+  visualizerStyle,
   onToggleDj,
   onSelectVibe,
   onToggleDjVoice,
   onChangeCrossfadeSec,
   onChangeEq,
+  onSaveCustomEq,
+  onToggleLoudnessNorm,
+  onChangeVisualizerStyle,
   onSpeakNow,
   onTriggerCrossfadeNext,
   onImportLocalLossless,
 }: DjMixConsoleProps) {
   const activeVibe = DJ_VIBES.find((v) => v.id === djVibe) ?? DJ_VIBES[0];
+  const bands = resolveEqBands(eq);
 
   return (
     <div className="dj-console-wrap">
@@ -152,11 +214,7 @@ export function DjMixConsole({
               "點擊左側 AI DJ 光球即可切換曲風、自動串接相關音樂，並在每首歌結尾自動執行 Bass-Swap 平滑 Crossfade 混音過渡。"}
           </p>
           <div className="hero-actions">
-            <button
-              type="button"
-              className="primary-btn"
-              onClick={onToggleDj}
-            >
+            <button type="button" className="primary-btn" onClick={onToggleDj}>
               <Radio size={15} />
               {djEnabled ? "關閉 AI DJ 自動混音" : "一鍵啟動 AI DJ Mix"}
             </button>
@@ -222,7 +280,13 @@ export function DjMixConsole({
         <div className="deck-bridge">
           <div className={`crossfade-pill ${crossfadeActive ? "live" : ""}`}>
             <AudioWaveform size={15} />
-            <span>{crossfadeActive ? "正在無縫 Crossfade..." : `自動混音過渡 ${crossfadeSec}s`}</span>
+            <span>
+              {crossfadeActive
+                ? "正在無縫 Crossfade..."
+                : crossfadeSec === 0
+                  ? "Gapless 無縫預載"
+                  : `自動混音過渡 ${crossfadeSec}s`}
+            </span>
           </div>
         </div>
 
@@ -254,15 +318,33 @@ export function DjMixConsole({
         </div>
       </section>
 
-      {/* Live Master FFT Spectrum Monitor */}
+      {/* Live Master FFT Spectrum Monitor with Visualizer Mode Selector */}
       <section className="panel-card" style={{ gap: 10 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
           <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text-secondary)" }}>
             即時 32-bit Float 主混音輸出頻譜 (Web Audio FFT)
           </span>
-          <span className="quality-badge">LIVE SPECTRUM</span>
+          <div className="chip-row">
+            {(
+              [
+                ["bars", "律動柱狀"],
+                ["wave", "雙向音波"],
+                ["aurora", "動態光暈"],
+              ] as const
+            ).map(([styleKey, label]) => (
+              <button
+                key={styleKey}
+                type="button"
+                className={`chip-btn ${visualizerStyle === styleKey ? "active" : ""}`}
+                style={{ padding: "4px 10px", fontSize: 11.5 }}
+                onClick={() => onChangeVisualizerStyle(styleKey)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
-        <SpectrumCanvas analyser={analyser} isPlaying={isPlaying} variant="wide" />
+        <SpectrumCanvas analyser={analyser} isPlaying={isPlaying} variant="wide" mode={visualizerStyle} />
       </section>
 
       {/* DJ Vibes */}
@@ -299,80 +381,108 @@ export function DjMixConsole({
         </div>
       </section>
 
-      {/* Crossfade, 32-bit Float Hi-Res EQ & Local Lossless Importer */}
+      {/* 10-Band Graphic EQ, Loudness Normalization, Crossfade & Local Lossless Importer */}
       <div className="settings-grid">
-        <section className="panel-card">
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+        <section className="panel-card" style={{ gridColumn: "1 / -1" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <Sliders size={16} style={{ color: "var(--accent-secondary)" }} />
-              <h3 style={{ margin: 0, fontSize: 15 }}>32-bit Float 母帶 EQ 與混音過渡</h3>
+              <h3 style={{ margin: 0, fontSize: 15 }}>10 段式圖形均衡器 (10-Band EQ) 與音量標準化</h3>
             </div>
-            <span className="quality-badge">DSP Active</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button
+                type="button"
+                className="secondary-btn"
+                style={{ padding: "5px 10px", fontSize: 11.5 }}
+                onClick={onSaveCustomEq}
+                title="將目前 10 段頻率曲線儲存為「自訂」預設"
+              >
+                <Save size={12} />
+                儲存自訂 EQ
+              </button>
+              <span className="quality-badge">10-Band DSP</span>
+            </div>
           </div>
 
           <div className="chip-row">
-            {(Object.keys(EQ_PRESETS) as EqPreset[]).map((key) => (
+            {(Object.keys(EQ_PRESETS) as Array<Exclude<EqPreset, "custom">>).map((key) => (
               <button
                 key={key}
                 type="button"
                 className={`chip-btn ${eq.preset === key ? "active" : ""}`}
-                onClick={() =>
+                onClick={() => {
+                  const nextBands = [...EQ_PRESETS[key].bands];
+                  const tri = summarizeBandsToTriBand(nextBands);
                   onChangeEq({
-                    ...EQ_PRESETS[key],
+                    ...eq,
+                    ...tri,
                     preset: key,
-                  })
-                }
+                    bands: nextBands,
+                  });
+                }}
               >
                 {EQ_PRESETS[key].label}
               </button>
             ))}
+            <button
+              type="button"
+              className={`chip-btn ${eq.preset === "custom" ? "active" : ""}`}
+              onClick={() => {
+                const nextBands =
+                  eq.customBands && eq.customBands.length === 10
+                    ? [...eq.customBands]
+                    : [...bands];
+                const tri = summarizeBandsToTriBand(nextBands);
+                onChangeEq({
+                  ...eq,
+                  ...tri,
+                  preset: "custom",
+                  bands: nextBands,
+                  customBands: nextBands,
+                });
+              }}
+            >
+              自訂儲存
+            </button>
           </div>
 
-          <div className="eq-sliders">
+          <div className="eq10-grid">
+            {EQ_BAND_LABELS.map((freqLabel, idx) => {
+              const val = bands[idx] ?? 0;
+              return (
+                <div key={freqLabel} className="eq10-col">
+                  <span className="eq10-val tabular-nums">
+                    {val > 0 ? `+${val}` : val}
+                  </span>
+                  <input
+                    type="range"
+                    className="eq10-slider"
+                    min={-12}
+                    max={12}
+                    step={0.5}
+                    value={val}
+                    aria-label={`${freqLabel} Hz 增益`}
+                    onChange={(e) => {
+                      const nextBands = [...bands];
+                      nextBands[idx] = Number(e.target.value);
+                      const tri = summarizeBandsToTriBand(nextBands);
+                      onChangeEq({
+                        ...eq,
+                        ...tri,
+                        preset: "custom",
+                        bands: nextBands,
+                      });
+                    }}
+                  />
+                  <span className="eq10-freq">{freqLabel}Hz</span>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="eq-sliders" style={{ marginTop: 6 }}>
             <label className="eq-row">
-              <span>Low (65Hz)</span>
-              <input
-                type="range"
-                className="range-slider"
-                min={-12}
-                max={12}
-                step={0.5}
-                value={eq.low}
-                style={{ "--progress": `${((eq.low + 12) / 24) * 100}%` } as React.CSSProperties}
-                onChange={(e) => onChangeEq({ ...eq, low: Number(e.target.value) })}
-              />
-              <span className="tabular-nums eq-val">{eq.low > 0 ? `+${eq.low}` : eq.low} dB</span>
-            </label>
-            <label className="eq-row">
-              <span>Mid (2.5kHz)</span>
-              <input
-                type="range"
-                className="range-slider"
-                min={-12}
-                max={12}
-                step={0.5}
-                value={eq.mid}
-                style={{ "--progress": `${((eq.mid + 12) / 24) * 100}%` } as React.CSSProperties}
-                onChange={(e) => onChangeEq({ ...eq, mid: Number(e.target.value) })}
-              />
-              <span className="tabular-nums eq-val">{eq.mid > 0 ? `+${eq.mid}` : eq.mid} dB</span>
-            </label>
-            <label className="eq-row">
-              <span>High (12kHz)</span>
-              <input
-                type="range"
-                className="range-slider"
-                min={-12}
-                max={12}
-                step={0.5}
-                value={eq.high}
-                style={{ "--progress": `${((eq.high + 12) / 24) * 100}%` } as React.CSSProperties}
-                onChange={(e) => onChangeEq({ ...eq, high: Number(e.target.value) })}
-              />
-              <span className="tabular-nums eq-val">{eq.high > 0 ? `+${eq.high}` : eq.high} dB</span>
-            </label>
-            <label className="eq-row">
-              <span>Crossfade 混音秒數</span>
+              <span>Crossfade 混音 (0s = 無縫)</span>
               <input
                 type="range"
                 className="range-slider"
@@ -383,33 +493,58 @@ export function DjMixConsole({
                 style={{ "--progress": `${(crossfadeSec / 12) * 100}%` } as React.CSSProperties}
                 onChange={(e) => onChangeCrossfadeSec(Number(e.target.value))}
               />
-              <span className="tabular-nums eq-val">{crossfadeSec} 秒</span>
+              <span className="tabular-nums eq-val">
+                {crossfadeSec === 0 ? "Gapless" : `${crossfadeSec} 秒`}
+              </span>
             </label>
+          </div>
+
+          <div className="auto-radio-card" style={{ marginTop: 4 }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                音量標準化 (Loudness Normalization)
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 2 }}>
+                自動平衡不同曲目與專輯間的響度落差，維持一致聽感
+              </div>
+            </div>
+            <button
+              type="button"
+              className={`toggle-switch ${loudnessNorm ? "on" : ""}`}
+              onClick={onToggleLoudnessNorm}
+              aria-label="切換音量標準化"
+            >
+              <span className="toggle-knob" />
+            </button>
           </div>
         </section>
 
-        <section className="panel-card">
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <FolderPlus size={16} style={{ color: "var(--accent-primary)" }} />
-            <h3 style={{ margin: 0, fontSize: 15 }}>本機無損音檔匯入 (FLAC / WAV / ALAC)</h3>
+        <section className="panel-card" style={{ gridColumn: "1 / -1" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <FolderPlus size={16} style={{ color: "var(--accent-primary)" }} />
+              <div>
+                <h3 style={{ margin: 0, fontSize: 15 }}>快速匯入本機無損音檔 (FLAC / WAV / ALAC)</h3>
+                <p style={{ margin: "2px 0 0", fontSize: 12, color: "var(--text-secondary)" }}>
+                  支援直接載入本機音檔進入 10 段 EQ 與雙軌 Crossfade DJ 混音佇列；完整資料夾掃描可於「收藏與紀錄」執行。
+                </p>
+              </div>
+            </div>
+            <label className="primary-btn" style={{ width: "fit-content", cursor: "pointer" }}>
+              <FolderPlus size={15} />
+              <span>選擇本機無損音檔</span>
+              <input
+                type="file"
+                accept=".flac,.wav,.alac,.m4a,.aac,.ogg,.mp3,audio/*"
+                multiple
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  onImportLocalLossless(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+            </label>
           </div>
-          <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-secondary)", lineHeight: 1.6 }}>
-            支援直接載入本機高解析無損音檔（FLAC、WAV、ALAC、MP3），免上傳雲端即刻進入 32-bit Float DSP 與雙軌 Crossfade DJ 混音佇列。
-          </p>
-          <label className="primary-btn" style={{ width: "fit-content", cursor: "pointer" }}>
-            <FolderPlus size={15} />
-            <span>選擇本機無損音檔</span>
-            <input
-              type="file"
-              accept=".flac,.wav,.alac,.m4a,.aac,.ogg,.mp3,audio/*"
-              multiple
-              style={{ display: "none" }}
-              onChange={(e) => {
-                onImportLocalLossless(e.target.files);
-                e.target.value = "";
-              }}
-            />
-          </label>
         </section>
       </div>
     </div>

@@ -83,7 +83,7 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let parts: Vec<&str> = request_line.trim_end().split_whitespace().collect();
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Ok(());
     }
@@ -127,6 +127,58 @@ async fn handle_connection(
     };
     if path == "/health" {
         let _ = write_simple_response(&mut socket, "200 OK", "text/plain; charset=utf-8", b"ok").await;
+        return Ok(());
+    }
+
+    if path == "/focus" {
+        if let Some(tx) = state.focus_tx.read().await.as_ref() {
+            let _ = tx.send(());
+        }
+        let _ = write_simple_response(&mut socket, "200 OK", "text/plain; charset=utf-8", b"focused").await;
+        return Ok(());
+    }
+
+    if path == "/local" {
+        if method != "GET" && method != "HEAD" {
+            let _ = write_simple_response(
+                &mut socket,
+                "405 Method Not Allowed",
+                "text/plain",
+                b"Method Not Allowed",
+            )
+            .await;
+            return Ok(());
+        }
+        let raw_path = query_str
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("path="))
+            .unwrap_or("");
+        let decoded = urlencoding::decode(raw_path).unwrap_or_default().to_string();
+        let local_path = Path::new(&decoded);
+        let ext = local_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if decoded.is_empty()
+            || !matches!(
+                ext.as_str(),
+                "flac" | "wav" | "mp3" | "ogg" | "m4a" | "alac" | "aiff" | "opus" | "aac" | "webm"
+            )
+            || !local_path.is_file()
+        {
+            let _ = write_simple_response(&mut socket, "404 Not Found", "text/plain", b"Local audio not found").await;
+            return Ok(());
+        }
+        let mime_type = cache::mime_from_extension(&ext);
+        let _ = serve_cached_file(
+            &mut socket,
+            &method,
+            local_path,
+            mime_type,
+            range_header.as_deref(),
+        )
+        .await;
         return Ok(());
     }
 
